@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+# recorded clips + manifest are data, not code (keep the dir, ignore contents)
+data/clips/*.json
+data/manifest.jsonl
