@@ -16,24 +16,53 @@ client alongside to watch what you are labeling; both share the warm stream.
 """
 import argparse
 import json
+import os
 import sys
 import time
-from collections import deque
 
 from . import config
 from . import detect
 from . import stream
-from .classify import classify_window, median_window
-from .zones import N, State
+from .classify import median_window
+from .engine import StateEngine
+from .zones import N, ORIENTATION
 
 SCHEMA = "bathroom-clip/1"
-ORIENTATION = "display: rotate_cw -> flip_x -> flip_y; row0=top, col0=column A"
 WINDOW = 5  # trailing frames the per-frame auto state is denoised over
 BASELINE_SECONDS = 6
 
 
 def _flat(matrix):
     return [matrix[r][c] for r in range(N) for c in range(N)]
+
+
+def _write_json(path, doc):
+    """Atomic write: temp file in the same dir, then rename. A crash mid-write
+    leaves the temp file, never a half-written clip the loader would choke on."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(doc, f)
+    os.replace(tmp, path)
+
+
+def _corpus_hint():
+    """One line summarizing the current label mix, so the operator can balance
+    classes as they capture. Reads the manifest; silent if absent/unreadable."""
+    counts = {}
+    try:
+        with open(config.MANIFEST) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+                counts[d.get("label", "?")] = counts.get(d.get("label", "?"), 0) + 1
+    except (OSError, ValueError):
+        return
+    if counts:
+        mix = ", ".join("%s=%d" % kv for kv in sorted(counts.items()))
+        fewest = min(counts, key=counts.get)
+        sys.stderr.write("corpus so far: %s   (lightest: %s)\n" % (mix, fewest))
 
 
 def _status(state, n, elapsed, door):
@@ -66,20 +95,21 @@ def _waiting(attempt, total):
 def record_clip(label, seconds, notes=None):
     config.ensure_dirs()
     baseline = config.load_baseline()
-    win = deque(maxlen=WINDOW)
+    eng = StateEngine(baseline=baseline, window=WINDOW)
     frames = []
 
     def on_frame(m, t):
-        win.append(m)
-        st, _ = classify_window(list(win), baseline)
+        u = eng.update(m, t)
         frames.append({
             "t": round(t, 3),
             "mm": _flat(m),
             "door_open_pct": detect.door_open_pct(m),
-            "state_auto": st.name,
+            "state_auto": u.instant.name,        # per-frame classifier (raw)
+            "state_engine": u.committed.name,    # debounced temporal engine
         })
-        _status(st, len(frames), t, frames[-1]["door_open_pct"])
+        _status(u.committed, len(frames), t, frames[-1]["door_open_pct"])
 
+    _corpus_hint()
     sys.stderr.write("recording label=%r (%s). Ctrl-C to stop.\n"
                      % (label, "%ds" % seconds if seconds else "open-ended"))
     start = _capture(seconds, on_frame)
@@ -90,6 +120,7 @@ def record_clip(label, seconds, notes=None):
                          % (stream.HOST, stream.PORT))
         return 1
 
+    eng.close()
     end = start + frames[-1]["t"]
     dur = frames[-1]["t"] or 1e-9
     clip_id = "%s_%d" % (_slug(label), int(start))
@@ -107,19 +138,23 @@ def record_clip(label, seconds, notes=None):
         "orientation": ORIENTATION,
         "baseline": baseline,
         "auto_state_counts": auto_counts,
+        "timeline": eng.segments(),     # debounced state segments over the clip
         "notes": notes,
         "frames": frames,
     }
-    config.ensure_dirs()
     path = "%s/%s.json" % (config.CLIPS_DIR, clip_id)
-    with open(path, "w") as f:
-        json.dump(doc, f)
-    with open(config.MANIFEST, "a") as f:
-        f.write(json.dumps({
-            "clip_id": clip_id, "label": label, "n": len(frames),
-            "hz": doc["hz"], "started": doc["started"],
-            "auto_state_counts": auto_counts, "file": path, "notes": notes,
-        }) + "\n")
+    _write_json(path, doc)
+    # the clip on disk is authoritative (dataset globs the dir); the manifest is
+    # a convenience index, so a failed append warns but never loses the clip.
+    try:
+        with open(config.MANIFEST, "a") as f:
+            f.write(json.dumps({
+                "clip_id": clip_id, "label": label, "n": len(frames),
+                "hz": doc["hz"], "started": doc["started"],
+                "auto_state_counts": auto_counts, "file": path, "notes": notes,
+            }) + "\n")
+    except OSError as e:
+        sys.stderr.write("warning: clip saved but manifest update failed: %s\n" % e)
 
     sys.stderr.write("saved %d frames @ %.1f Hz -> %s\n"
                      % (len(frames), doc["hz"], path))
@@ -141,8 +176,7 @@ def record_baseline(seconds):
     matrix = median_window(frames)
     doc = {"captured": round(time.time(), 3), "frames": len(frames),
            "orientation": ORIENTATION, "matrix": matrix}
-    with open(config.BASELINE_FILE, "w") as f:
-        json.dump(doc, f, indent=1)
+    _write_json(config.BASELINE_FILE, doc)
     sys.stderr.write("baseline (%d frames, median) -> %s\n"
                      % (len(frames), config.BASELINE_FILE))
     return 0
@@ -164,9 +198,9 @@ def main():
     args = ap.parse_args()
     if args.baseline:
         return record_baseline(args.seconds or BASELINE_SECONDS)
-    if not args.label:
-        ap.error("--label is required (or use --baseline)")
-    return record_clip(args.label, args.seconds, args.notes)
+    if not args.label or not args.label.strip():
+        ap.error("--label must be a non-empty ground-truth label (or use --baseline)")
+    return record_clip(args.label.strip(), args.seconds, args.notes)
 
 
 if __name__ == "__main__":

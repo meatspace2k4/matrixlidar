@@ -1,33 +1,38 @@
 """Ground-truth state classifier for the bathroom matrix lidar.
 
-This is the gap the existing code deferred: snapshot.py reports
-"Status: DEFERRED" and detect.py stops at zone values. Here we turn an
-oriented 8x8 frame into one of the operator's labeled states (see
-zones.State) deterministically and explainably, so it can serve as ground
-truth for recorded clips.
+This is the gap the existing code deferred (snapshot.py reported
+"Status: DEFERRED"). It turns an oriented 8x8 frame into one of the operator's
+labeled states (zones.State) deterministically and explainably, so it can serve
+as ground truth for recorded clips.
 
 How it decides
 --------------
-Distances are in mm; smaller = closer to the sensor. The sensor sits between
-the user and the toilet, so a body reads CLOSER than the empty-room baseline
-at whatever it occludes. We measure occlusion as a per-cell *depression*
-below a captured empty baseline rather than absolute thresholds, because the
-empty field is a non-uniform "bowl" (center columns naturally read ~1600mm,
-edges ~1100mm). The DOOR column (H) is excluded from presence entirely: it
-swings 1000->4000mm on its own and says nothing about a body.
+Distances are mm; smaller = closer. The sensor sits between the user and the
+toilet, so a body reads CLOSER than the empty-room baseline at whatever it
+occludes. We measure occlusion as a per-cell *depression* below a captured
+empty baseline (the field is a non-uniform bowl, so absolute thresholds are
+wrong). The DOOR column (H) is excluded from presence: it swings 1000->4000mm
+on its own and says nothing about a body.
 
-Discriminators, derived from the four labeled captures:
-  EMPTY               almost no occluded cells.
-  WALKING             a body right at the sensor: many cells very near
-                      (< VNEAR_MM, ~350-460mm in the sample), large area.
-  STANDING_AT_TOILET  body upright -> it occludes the TOP rows of the field
-                      (a tall vertical band, near values reach rows 1-2).
-  SITTING_AT_TOILET   body low -> the top rows stay at baseline while the
-                      occluded cells cluster in the bottom rows / toilet.
+Discriminators, calibrated on the four labeled captures AND hardened against
+the boundary failures an adversarial review surfaced (see tests/):
+  EMPTY   almost no occluded cells, OR a tiny co-located noise cluster.
+  WALKING a body filling the near field in front of the sensor: many very-near
+          cells, OR near cells spanning >=4 columns (so it is robust to the
+          exact VNEAR cutoff: a body at ~650mm across the width still reads
+          WALKING instead of flipping to STANDING).
+  STANDING upright body -> it occludes the TOP rows DEEPLY (>= DEEP_DELTA below
+          baseline). One deep top cell over a real body footprint is enough,
+          so a narrow/off-center stance is not misread as sitting.
+  SITTING low/seated body -> top stays at baseline (no deep top occlusion) while
+          occluded cells cluster low. The toilet zone alone is NOT sufficient
+          (door swing / dust on those 4 cells would otherwise read SITTING).
+  UNKNOWN a body is present but matches no posture cleanly. Returned instead of
+          a confident wrong label, so auto-labels stay trustworthy as ground
+          truth.
 
-Tuned constants live in `Params`; recalibrate from labeled clips with
-`tune.py` if the geometry changes. The classifier is pure (no I/O) so the Pi
-snapshot tool and the live client share identical logic.
+Tuned constants live in `Params`; calibrate.py sweeps them over the labeled
+corpus. The classifier is pure (no I/O).
 """
 import statistics
 
@@ -35,29 +40,27 @@ from .zones import N, NO_TARGET, DOOR_COL, ZONE_CELLS, Zone, State
 
 
 class Params:
-    # a cell counts as occupied if it reads this many mm CLOSER than baseline
-    DELTA_MM = 300
-    # baseline cells reading no-target are unreliable; cap them here for delta
-    BASELINE_CAP = 1500
-    # "very near" => body essentially at the sensor lens
-    VNEAR_MM = 650
-    # WALKING needs at least this many very-near cells (a whole body up close)
-    VNEAR_MIN = 8
-    # EMPTY if at most this many cells are occupied (tolerates sensor specks)
-    EMPTY_MAX = 2
-    # STANDING: this many occupied cells in the top rows (upright body occludes
-    # the upper field)
-    UPPER_ROWS = (0, 1)
-    UPPER_MIN = 2
-    # SITTING: occupied cells clustered low when the top is clear
-    LOWER_ROWS = (5, 6, 7)
-    LOWER_MIN = 3
+    DELTA_MM = 300          # cell is "occupied" if this many mm closer than baseline
+    DEEP_DELTA = 500        # cell is "deeply" occluded (a body, not an edge graze)
+    BASELINE_CAP = 1500     # no-target baseline cells capped here for delta math
+    VNEAR_MM = 650          # "very near" => body essentially at the sensor lens
+    VNEAR_MIN = 8           # WALKING via this many very-near cells
+    NEAR_SOFT = 850         # softer "near" band, used for the column-spread rule
+    NEAR_MIN = 10           # WALKING via this many near cells ...
+    NEAR_COLS_MIN = 4       # ... spread across at least this many columns
+    EMPTY_MAX = 2           # EMPTY if at most this many occupied cells
+    NOISE_MAX = 4           # a cluster this small that fits in a 2x2 box is noise
+    MIN_BODY = 5            # fewer occupied cells than this is not a posture
+    UPPER_ROWS = (0, 1)     # the top of the field (occluded when upright)
+    LOWER_ROWS = (5, 6, 7)  # the bottom of the field (occluded when seated)
+    DEEP_UPPER_MIN = 1      # STANDING needs this many deeply-occluded top cells
+    LOWER_MIN = 3           # SITTING needs this many occupied bottom cells
 
 
 # Default empty-room baseline: the labeled door-CLOSED capture
 # (~/snapshots/labeled.jsonl), a clean unoccupied frame. The single 4000 is a
-# dropout and is handled by BASELINE_CAP. Operators should capture their own
-# with `python3 -m bathroom.record --baseline`; this is the fallback.
+# dropout, handled by BASELINE_CAP. Operators capture their own with
+# `python3 -m bathroom.record --baseline`; this is the fallback.
 DEFAULT_BASELINE = [
     [1115, 1185, 1290, 1400, 1318, 1163, 1155, 1044],
     [1210, 1343, 1453, 1496, 1303, 1155, 1152, 1050],
@@ -75,24 +78,22 @@ def _eff_base(b):
 
 
 def median_window(frames):
-    """Element-wise median over a list of oriented frames -> denoised frame.
-
-    Kills isolated 4000 dropouts and per-frame jitter the same way the
-    snapshot tool does. `frames` must be non-empty.
-    """
+    """Element-wise median over oriented frames -> denoised frame. Kills
+    isolated 4000 dropouts and per-frame jitter. `frames` must be non-empty."""
+    if not frames:
+        raise ValueError("median_window requires at least one frame")
     return [[int(statistics.median(f[r][c] for f in frames))
              for c in range(N)] for r in range(N)]
 
 
 def features(matrix, baseline=None):
-    """Compute the presence features used by the decision rule.
-
-    Returns a plain dict so it can be logged alongside the state for audit.
-    The DOOR column is excluded from every presence measure.
-    """
+    """Presence features used by the decision rule. Plain dict so it can be
+    logged alongside the state for audit. DOOR column excluded throughout."""
     base = baseline or DEFAULT_BASELINE
-    occ = []          # occupied (occluded) cells, excluding the door column
-    vnear = 0         # cells essentially at the sensor
+    occ = []          # (r, c) occupied cells (closer than baseline by DELTA_MM)
+    deep = set()      # of those, the deeply occluded ones (>= DEEP_DELTA)
+    vnear = 0         # cells essentially at the sensor (< VNEAR_MM)
+    near_cells = []   # cells in the softer near band (< NEAR_SOFT)
     for r in range(N):
         for c in range(N):
             if c == DOOR_COL:
@@ -102,45 +103,78 @@ def features(matrix, baseline=None):
                 continue
             if v < Params.VNEAR_MM:
                 vnear += 1
-            if v < _eff_base(base[r][c]) - Params.DELTA_MM:
+            if v < Params.NEAR_SOFT:
+                near_cells.append((r, c))
+            depression = _eff_base(base[r][c]) - v
+            if depression >= Params.DELTA_MM:
                 occ.append((r, c))
+                if depression >= Params.DEEP_DELTA:
+                    deep.add((r, c))
 
-    upper = sum(1 for (r, _c) in occ if r in Params.UPPER_ROWS)
-    lower = sum(1 for (r, _c) in occ if r in Params.LOWER_ROWS)
-    toto_occ = any((r, c) in occ for (r, c) in ZONE_CELLS[Zone.TOTO])
+    occ_rows = sorted({r for (r, _c) in occ})
+    occ_cols = sorted({c for (_r, c) in occ})
+    upper = [rc for rc in occ if rc[0] in Params.UPPER_ROWS]
+    lower = [rc for rc in occ if rc[0] in Params.LOWER_ROWS]
+    deep_upper = [rc for rc in upper if rc in deep]
+    near_cols = {c for (_r, c) in near_cells}
     occ_mm = [matrix[r][c] for (r, c) in occ]
+    noise_cluster = (
+        0 < len(occ) <= Params.NOISE_MAX
+        and (max(occ_rows) - min(occ_rows) <= 1)
+        and (max(occ_cols) - min(occ_cols) <= 1)
+    ) if occ else False
 
     return {
         "occ_count": len(occ),
         "vnear_count": vnear,
-        "upper_count": upper,
-        "lower_count": lower,
-        "toto_occluded": toto_occ,
+        "near_count": len(near_cells),
+        "near_cols": len(near_cols),
+        "upper_count": len(upper),
+        "deep_upper": len(deep_upper),
+        "lower_count": len(lower),
+        "toto_occluded": any(rc in occ for rc in ZONE_CELLS[Zone.TOTO]),
+        "noise_cluster": noise_cluster,
+        "row_spread": (max(occ_rows) - min(occ_rows) + 1) if occ_rows else 0,
+        "col_spread": (max(occ_cols) - min(occ_cols) + 1) if occ_cols else 0,
         "min_mm": min(occ_mm) if occ_mm else None,
-        "top_row": min((r for (r, _c) in occ), default=None),
+        "top_row": occ_rows[0] if occ_rows else None,
         "occ_cells": occ,
     }
 
 
 def classify(matrix, baseline=None):
-    """Map an oriented (already denoised) frame to a (State, features) pair.
+    """Map an oriented (denoised) frame to a (State, features) pair.
 
-    Order matters: EMPTY and WALKING are checked before the posture split,
-    because a body up close also occludes the upper field.
+    Order matters: EMPTY/noise and WALKING are resolved before the posture
+    split, because a body up close also occludes the upper field. A present-
+    but-unclassifiable body returns UNKNOWN rather than a confident guess.
     """
     f = features(matrix, baseline)
+    min_mm = f["min_mm"] if f["min_mm"] is not None else NO_TARGET
 
-    if f["occ_count"] <= Params.EMPTY_MAX:
+    if f["occ_count"] <= Params.EMPTY_MAX or f["noise_cluster"]:
         return State.EMPTY, f
+    # WALKING: a body filling the near field in front of the sensor.
     if f["vnear_count"] >= Params.VNEAR_MIN:
         return State.WALKING, f
-    if f["upper_count"] >= Params.UPPER_MIN:
+    if (f["near_cols"] >= Params.NEAR_COLS_MIN
+            and f["near_count"] >= Params.NEAR_MIN
+            and min_mm < Params.NEAR_SOFT + 100):
+        return State.WALKING, f
+    # below WALKING but too little structure to call a posture
+    if f["occ_count"] < Params.MIN_BODY:
+        return State.UNKNOWN, f
+    # STANDING: upright body occludes the top rows DEEPLY.
+    if f["deep_upper"] >= Params.DEEP_UPPER_MIN:
         return State.STANDING_AT_TOILET, f
-    if f["toto_occluded"] or f["lower_count"] >= Params.LOWER_MIN:
+    # SITTING: low body, top clear (no deep top occlusion), bottom occupied.
+    if f["lower_count"] >= Params.LOWER_MIN and f["deep_upper"] == 0:
         return State.SITTING_AT_TOILET, f
     return State.UNKNOWN, f
 
 
 def classify_window(frames, baseline=None):
     """Denoise a window of frames, then classify. `frames` must be non-empty."""
+    if not frames:
+        raise ValueError("classify_window requires at least one frame")
     return classify(median_window(frames), baseline)

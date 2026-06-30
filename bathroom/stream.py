@@ -78,6 +78,9 @@ def frames(host=HOST, port=PORT, on_wait=None):
         except OSError:
             pass  # dropped; loop back and reconnect
         finally:
+            # makefile() wraps the socket but does NOT close it; close it here.
+            # This is a generator, so on an early `break` the finally runs when
+            # the generator is closed (GC or explicit .close()), releasing the fd.
             try:
                 sock.close()
             except OSError:

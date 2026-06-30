@@ -25,6 +25,10 @@ from enum import IntEnum
 N = 8
 NO_TARGET = 4000  # sensor value meaning "nothing in range" (mm)
 
+# the calibrated orientation chain every frame is stored in; clips/baselines
+# record this string so a loader can refuse data from a differently-oriented setup
+ORIENTATION = "display: rotate_cw -> flip_x -> flip_y; row0=top, col0=column A"
+
 
 class Zone(IntEnum):
     NONE = 0       # no blob / empty
@@ -83,6 +87,38 @@ CELL_ZONE = {}
 for _z, _cs in ZONE_CELLS.items():
     for _rc in _cs:
         CELL_ZONE[_rc] = _z
+
+
+# operator label strings (verbatim, from --label) -> ground-truth State.
+# Maps the casual words a person types while capturing to the enum.
+_LABEL_ALIASES = {
+    "empty": State.EMPTY, "idle": State.EMPTY, "none": State.EMPTY, "away": State.EMPTY,
+    "walking": State.WALKING, "walk": State.WALKING, "passing": State.WALKING,
+    "infront": State.WALKING, "in-front": State.WALKING, "crossing": State.WALKING,
+    "standing": State.STANDING_AT_TOILET, "stand": State.STANDING_AT_TOILET,
+    "standing-at-toilet": State.STANDING_AT_TOILET, "at-toilet": State.STANDING_AT_TOILET,
+    "sitting": State.SITTING_AT_TOILET, "sit": State.SITTING_AT_TOILET, "seated": State.SITTING_AT_TOILET,
+    "sitting-at-toilet": State.SITTING_AT_TOILET, "toilet": State.SITTING_AT_TOILET,
+    "unknown": State.UNKNOWN, "ambiguous": State.UNKNOWN,
+}
+
+
+def from_label(s):
+    """Normalize an operator label string to a State, or None if unrecognized.
+
+    Accepts the enum names too (e.g. 'SITTING_AT_TOILET'). Ground-truth labels
+    are noisy free text; this is the single place that decides what they mean."""
+    if s is None:
+        return None
+    if isinstance(s, State):
+        return s
+    key = str(s).strip().lower().replace(" ", "-")
+    if key in _LABEL_ALIASES:
+        return _LABEL_ALIASES[key]
+    for st in State:
+        if st.name.lower() == key.replace("-", "_"):
+            return st
+    return None
 
 
 def label(r, c):

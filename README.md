@@ -1,137 +1,178 @@
-# matrixlidar — bathroom presence interface
+# matrixlidar — bathroom presence interface + grounding harness
 
 Client-side interface to a DFRobot Matrix Lidar (SEN0628, 8x8 time-of-flight,
 mm) watching a small bathroom. It reports **ground-truth presence states** from
-the live sensor and **captures labeled time-series clips** for training a
-sequence (transformer) model.
+the live sensor, runs an **end-to-end temporal state engine** (with a live
+sparkline), **captures labeled time-series clips** for training a transformer,
+and **grounds/validates** the engine — and later the model — against real
+labeled snapshots.
 
-The sensor and its always-on server live on the Pi (`jpark@bath-pi.local`).
-This repo is the Mac/client half: it reads the warm stream, classifies, draws
-the heatmap, and records.
+The sensor and its always-on server run on the Pi (`jpark@bath-pi.local`); this
+repo is the Mac/client half.
 
 ## Architecture
 
 ```
-  Pi  /dev/ttyACM0 ──► lidar_server.py ──(TCP :8628, raw 64-value frames)──►  this client
-                       (always on, holds the serial port, broadcasts)
+  Pi /dev/ttyACM0 ─► lidar_server.py ─(TCP :8628, raw 64-value frames)─►  this client
+                     (always on, holds the serial port, broadcasts)
+
+  stream.orient ─► classify (per frame) ─► engine (temporal, debounced) ─► state + timeline
+                                        └► record (labeled clips) ─► validate / train
 ```
 
-Reading the broadcast stream means **no serial cold start and no contention**:
-the heatmap, the live readout, and a recording can all run at once and never
-steal the port from the server (unlike the Pi's direct-serial snapshot tool).
-Each frame is oriented locally into display orientation (row 0 = top, col 0 =
-column A) — the same calibrated transform the heatmap uses.
+Reading the broadcast stream means no serial cold start and no contention: the
+heatmap, the live readout, and a recording all share it and never steal the
+port from the server. Frames are oriented locally (row 0 = top, col 0 = column A).
 
-## Ground-truth states
+## Two layers
 
-`bathroom/classify.py` maps each (denoised) frame to one of these
-(`bathroom/zones.py:State`):
+- **Per-frame classifier** (`bathroom/classify.py`): one oriented frame → one
+  state, baseline-relative (a body reads closer than the empty room at whatever
+  it occludes; the DOOR column H is excluded because it swings on its own).
+- **Temporal engine** (`bathroom/engine.py`): debounces the classifier with
+  hysteresis, adopts the first observation as its initial state, and emits a
+  **timeline of stable segments**. Segments are exactly what a sequence model
+  is trained to reproduce.
 
-| State | What it is | How it's detected |
+### Ground-truth states (`zones.State`)
+
+| State | What | How detected (hardened against boundary cases) |
 |---|---|---|
-| `EMPTY` | no body in the field | almost no cells closer than the empty baseline |
-| `WALKING` | body crossing close in front of the sensor; toilet obscured | many cells very near (< 650 mm), large area |
-| `STANDING_AT_TOILET` | body upright between toilet and door | occlusion reaches the **top** rows (tall vertical band) |
-| `SITTING_AT_TOILET` | body seated on the toilet | top rows stay at baseline; occlusion clusters **low** / at the toilet |
-| `UNKNOWN` | ambiguous / transitional | none of the above fire (never forced to a guess) |
+| `EMPTY` | no body | almost no occluded cells, or a tiny co-located noise cluster |
+| `WALKING` | body crossing close in front of the sensor | many very-near cells, **or** near cells spanning ≥4 columns (robust to the exact near cutoff) |
+| `STANDING_AT_TOILET` | upright between toilet and door | top rows occluded **deeply** (one deep top cell over a real footprint is enough) |
+| `SITTING_AT_TOILET` | seated on the toilet | top clear (no deep top occlusion), occluded cells cluster low; the toilet zone **alone** is not sufficient |
+| `UNKNOWN` | body present, no clean posture | returned instead of a confident wrong label |
 
-Detection is **baseline-relative**: a body reads closer than the empty room at
-whatever it occludes (the sensor sits between the user and the toilet). We
-measure per-cell depression below a captured empty baseline rather than using
-absolute thresholds, because the empty field is a non-uniform "bowl". The
-**DOOR column (H) is excluded from presence** — it swings 1000→4000 mm on its
-own and says nothing about a body. Door state is reported separately as
-`open%` (column H median, 1000 mm = 0%, ≥1400 mm = 100%).
-
-The thresholds (`classify.Params`) are calibrated against the four labeled
-captures; `tests/test_classify.py` pins them. Re-run it after any tuning:
-
-```
-python3 tests/test_classify.py     # all four labeled states must PASS
-```
+Door state is separate: `open%` from column H (1000mm = 0%, ≥1400 = 100%).
 
 ## Use
 
-Run everything from the repo root (so `import bathroom` resolves). Python 3
-stdlib only for capture; `numpy` only for the training loader.
+Run from the repo root (so `import bathroom` resolves). Stdlib only for
+capture; `numpy` only for the training loader.
 
 ```
-python3 heatmap_client.py                 # live heatmap + zone panel + STATE line
-python3 -m bathroom.live                  # text-only live state readout
-python3 -m bathroom.live --verbose        # + feature dump on each state change
+python3 heatmap_client.py            # live heatmap + zone panel + STATE + sparkline
+python3 -m bathroom.live             # text live readout: state, door%, occupancy sparkline, state strip
+python3 -m bathroom.engine <clip>    # static render of a recorded clip (timeline + sparkline)
 ```
 
-### Capture labeled clips (for training)
+### Capture labeled clips
 
 ```
 python3 -m bathroom.record --label sitting  --seconds 30
-python3 -m bathroom.record --label standing --seconds 30
-python3 -m bathroom.record --label walking                 # until Ctrl-C
-python3 -m bathroom.record --label empty    --seconds 60
+python3 -m bathroom.record --label walking                # until Ctrl-C
+python3 -m bathroom.record --baseline                     # empty-room baseline
 ```
 
-`--label` is **your verbatim ground truth** for the whole clip. Watch
-`heatmap_client.py` in another pane while you record to see what's happening.
-Each clip preserves the **full time series** (nothing is collapsed to a
-median, unlike the Pi snapshot tool): one self-describing JSON under
-`data/clips/`, plus a one-line summary appended to `data/manifest.jsonl`.
+`--label` is your verbatim ground truth. The recorder prints the current corpus
+mix so you can balance classes, writes the clip atomically, and preserves the
+**full time series** (per-frame `mm`, `state_auto`, debounced `state_engine`,
+`door_open_pct`) plus the `timeline`, the `baseline` used, and `orientation`.
 
-### Empty-room baseline
+### Inspect / correct a clip
 
 ```
-python3 -m bathroom.record --baseline       # leave the room; ~6 s median
+python3 -m bathroom.review data/clips/sitting_123.json                 # render
+python3 -m bathroom.review <clip> --set-label standing                 # relabel whole clip
+python3 -m bathroom.review <clip> --relabel 0:90=standing,90:240=sitting
 ```
 
-Writes `baselines/empty.json`, which the classifier prefers over the built-in
-default. Best captured with the **room empty and the door closed**. A clean
-default (real data from this install) already ships.
+Per-frame `corrections` (frame-index ranges) become per-frame ground truth via
+`dataset.effective_labels`, so a clip with a mid-capture transition trains correctly.
 
-## Clip format (`schema: bathroom-clip/1`)
+## Grounding & validation (the model harness)
 
-```jsonc
-{
-  "clip_id": "sitting_1782787142",
-  "label": "sitting",                 // operator ground truth (verbatim)
-  "started": 1782787142.4, "ended": ..., "n": 440, "hz": 14.7,
-  "orientation": "display: rotate_cw -> flip_x -> flip_y; row0=top, col0=A",
-  "baseline": [[...8x8...]],          // baseline used for the auto states
-  "auto_state_counts": {"SITTING_AT_TOILET": 430, "UNKNOWN": 10},
-  "frames": [
-    {"t": 0.0, "mm": [64 ints, row-major oriented],
-     "door_open_pct": 39.0, "state_auto": "SITTING_AT_TOILET"},
-    ...
-  ]
-}
+One tool scores any predictor against the labeled snapshots — the engine today,
+the trained model later, with identical metrics:
+
+```
+python3 -m bathroom.validate                              # temporal engine
+python3 -m bathroom.validate --predictor frame            # per-frame classifier
+python3 -m bathroom.validate --frame-level                # per-frame metrics too
+python3 -m bathroom.validate --predictions model.jsonl    # score a MODEL's output
+python3 -m bathroom.validate --min-accuracy 0.9           # regression gate (nonzero exit if below)
 ```
 
-`mm` is the oriented frame, row-major (reshape to 8x8). `state_auto` is the
-classifier's per-frame guess (advisory, denoised over a 5-frame window);
-`label` is the authoritative target. Load for training:
+Model predictions are JSONL keyed by sample id: `{"id": "sitting_seed", "pred":
+"SITTING_AT_TOILET"}`. Output is accuracy, per-class precision/recall/F1, and a
+confusion matrix (`bathroom/metrics.py`). Labeled snapshots come from
+`fixtures/labeled/` (seed set, the four operator captures) + `data/clips/`
+(`bathroom/ingest.py`).
+
+### Corpus tools
+
+```
+python3 -m bathroom.dataset --summary       # class balance over the corpus
+python3 -m bathroom.dataset --split 0.2      # deterministic train/val clip ids
+python3 -m bathroom.dataset --vocab          # write data/vocab.json (label source of truth)
+python3 -m bathroom.dataset --validate       # scan for corrupt clips
+python3 -m bathroom.calibrate                # threshold sweep over labeled data
+python3 -m bathroom.baselines --age          # baseline staleness
+python3 -m bathroom.baselines --check-drift  # vs newest empty clip (or --live N)
+```
+
+### Training loader
 
 ```python
 from bathroom import dataset
-for clip in dataset.iter_clips():
-    x, y, auto = dataset.to_arrays(clip)   # x: (T, 8, 8) int32, y: label str
+for clip in dataset.iter_clips():            # corrupt files skipped + warned
+    tr = dataset.to_training(clip)
+    x        = tr["x"]          # (T, 8, 8) int32 oriented distances
+    mask     = tr["mask"]       # (T, 8, 8) bool, True at no-target (4000) dropouts
+    y        = tr["y"]          # operator label for the clip
+    y_frames = tr["y_frames"]   # per-frame labels (corrections applied)
+    base     = tr["baseline"]   # (8, 8) reference the auto states used
+    # also: times, dt, gaps, door_open_pct, state_auto, state_engine, hz
 ```
+
+## Tests
+
+```
+python3 tests/run.py     # classifier + adversarial + pipeline + grounding gates
+```
+
+`test_classify.py` pins the four labeled captures; `test_classify_adversarial.py`
+pins four boundary cases an independent review surfaced (sparse-top standing,
+toilet-only noise, walking at the near cutoff, upper-row noise);
+`test_pipeline.py` pins the clip round-trip, corrections, split, and the
+corrupt-input fallbacks; the grounding gates require the engine and the frame
+classifier to score 1.0 on the labeled fixtures.
+
+## Critique (tickle harness)
+
+This project is registered as a target in `~/crit-o-matic/tickle`
+(`targets/matrixlidar/`), the operator's POC-or-GTFO critique harness. Grounding
+the engine against the labeled snapshots surfaced a real functional break —
+**F-M001**: the temporal engine dropped the occupancy event for any clip shorter
+than `commit_after` frames (a single-frame labeled snapshot read EMPTY
+regardless of truth). Demonstrated (0.25 → 1.00 on the reproducer), fixed
+(bootstrap the initial state), validated CONFIRMED, and pinned by the grounding
+gate.
 
 ## Layout
 
 ```
-heatmap_client.py        live heatmap + zone panel + STATE
+heatmap_client.py        live heatmap + zone panel + STATE + sparkline
 baselines/empty.json     empty-room reference for the classifier
 bathroom/
-  zones.py               zones + ground-truth State vocabulary
+  zones.py               zones + ground-truth State vocabulary + label aliases
   stream.py              warm-TCP reader -> oriented frames (auto-reconnect)
   detect.py              door open% + per-zone values
-  classify.py            the ground-truth state classifier  <-- the gap, filled
+  classify.py            per-frame ground-truth classifier (baseline-relative)
+  engine.py              temporal state machine (debounce, timeline) + CLI
+  sparkline.py           occupancy sparkline + colored state strip
   record.py              time-based labeled clip capture (CLI)
   live.py                live state readout (CLI)
-  dataset.py             load clips into training arrays
-  config.py              paths + baseline loading
+  review.py              inspect / per-frame relabel a clip (CLI)
+  validate.py            ground engine/frame/model vs labeled snapshots (CLI)
+  metrics.py             confusion matrix + precision/recall/F1
+  calibrate.py           threshold sweep over the labeled corpus (CLI)
+  baselines.py           baseline age + drift checks (CLI)
+  ingest.py              labeled snapshots -> uniform grounding corpus
+  dataset.py             load clips for training + corpus CLI (summary/split/vocab)
+  config.py              paths + robust baseline loading
 data/clips/              recorded clips (gitignored); manifest.jsonl indexes them
-tests/test_classify.py   calibration test on the four labeled captures
+fixtures/labeled/        seed labeled snapshots (the four operator captures)
+tests/                   regression suite (run.py)
 ```
-
-`zones.py` and `classify.py` are kept identical to the copies in the Pi's
-`~/matrixlidar/bathroom/` so the offline snapshot tool and this client report
-the same states.

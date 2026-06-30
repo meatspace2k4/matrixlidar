@@ -10,16 +10,17 @@ on this machine. Run from the project root so `import bathroom` resolves:
   python3 heatmap_client.py
 """
 import sys
+import time
 from collections import deque
 
-from bathroom import config, detect, stream
-from bathroom.classify import classify_window
+from bathroom import config, detect, sparkline, stream
+from bathroom.engine import StateEngine
 from bathroom.zones import N, NO_TARGET, Zone
 
 NEAR_MM = 100
 FAR_MM = 2000
 CELL_W = 6
-WINDOW = 5
+HIST = 40       # columns of rolling history under the panel
 STOPS = [
     (0.00, (12, 12, 40)), (0.20, (30, 60, 180)), (0.40, (0, 170, 170)),
     (0.60, (40, 190, 60)), (0.78, (240, 220, 40)), (0.90, (240, 120, 20)),
@@ -49,7 +50,7 @@ def color_for(mm):
     return STOPS[-1][1]
 
 
-def render(m, state):
+def render(m, state, occ_hist, state_hist):
     out = ["\x1b[H", "\x1b[1m DFRobot Matrix Lidar  8x8 heatmap (mm)\x1b[0m\x1b[K\n\n"]
     for r in range(N):
         line = []
@@ -71,6 +72,9 @@ def render(m, state):
         extra = "  open=%.0f%%" % detect.door_open_pct(m) if z == Zone.DOOR else ""
         out.append("  %d %-9s %4d mm%s\x1b[K\n" % (int(z), z.name, v["median"], extra))
     out.append("\x1b[K\n \x1b[1mSTATE: %-20s\x1b[0m\x1b[K\n" % state.name)
+    hi = max(8, max(occ_hist) if occ_hist else 8)
+    out.append(" occ  |%s|\x1b[K\n" % sparkline.sparkline(occ_hist, lo=0, hi=hi))
+    out.append(" time  %s\x1b[K\n" % sparkline.state_strip(state_hist))
     sys.stdout.write("".join(out))
     sys.stdout.flush()
 
@@ -83,17 +87,23 @@ def _waiting(attempt, total):
 
 def main():
     baseline = config.load_baseline()
-    win = deque(maxlen=WINDOW)
+    eng = StateEngine(baseline=baseline)
+    occ_hist = deque(maxlen=HIST)
+    state_hist = deque(maxlen=HIST)
     started = False
+    t0 = None
     try:
         for m in stream.frames(on_wait=_waiting):
             if not started:
                 sys.stderr.write("\r\x1b[K")
                 sys.stdout.write("\x1b[2J\x1b[?25l")  # clear, hide cursor
                 started = True
-            win.append(m)
-            state, _ = classify_window(list(win), baseline)
-            render(m, state)
+            now = time.time()
+            t0 = t0 if t0 is not None else now
+            u = eng.update(m, now - t0)
+            occ_hist.append(u.features["occ_count"])
+            state_hist.append(u.committed)
+            render(m, u.committed, occ_hist, state_hist)
     except (KeyboardInterrupt, ConnectionError):
         pass
     finally:
