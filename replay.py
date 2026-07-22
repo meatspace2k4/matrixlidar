@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Fetch the Pi's transition archive and replay it.
 
-The server keeps raw-frame snapshots of committed transitions (see
-bathroom/archive.py) in a RAM ring, and appends each session to a JSON-lines
-log on disk when it closes. This rebuilds the timeline by time and replays the
-snapshots on the client, rendered like the live heatmap.
+Two sources, different content:
+  DUMP (default) the live RAM ring: raw-frame snapshots per transition, lost
+                 on a server restart. Replay renders the frame as a grid.
+  LOG (--log)    the persisted event log: just {ts, kind, from, to, event,
+                 boundary} per transition, no sensor values, survives a
+                 crash/power cycle. Replay prints the event line only.
 
   python3 replay.py                  # list sessions in the live RAM ring
   python3 replay.py --log            # list sessions from the persisted log
@@ -39,6 +41,23 @@ def fetch(host=stream.HOST, port=stream.PORT, query=b"DUMP"):
     raise ConnectionError("stream ended before the ARCHIVE reply")
 
 
+def _normalize(session):
+    """Both archive shapes -> a uniform list of transition dicts:
+    {ts, kind, from, to, event, boundary, frame}. DUMP (RAM ring) sessions
+    carry a raw-frame snapshot per transition; LOG (persisted) sessions are
+    events only, so frame is always None there."""
+    if "transitions" in session:  # DUMP: RAM ring, has frame snapshots
+        out = []
+        for tr in session["transitions"]:
+            m = tr["mark"]
+            out.append({"ts": tr["ts"], "t": m.get("t"), "kind": m.get("kind"),
+                       "from": m.get("from"), "to": m.get("to"),
+                       "event": m.get("event"), "boundary": m.get("boundary"),
+                       "frame": tr.get("frame")})
+        return out
+    return [dict(e, frame=None) for e in session["events"]]  # LOG: events only
+
+
 def _grid(frame_csv):
     flat = [int(x) for x in frame_csv.split(",")]
     m = stream.orient([flat[i * N:(i + 1) * N] for i in range(N)])
@@ -56,11 +75,10 @@ def _grid(frame_csv):
 
 
 def _label(tr):
-    m = tr["mark"]
     when = time.strftime("%H:%M:%S", time.localtime(tr["ts"]))
-    ev = " [%s]" % m["event"] if m.get("event") else ""
-    return "%s  t=%7.2fs  %-7s %s -> %s%s" % (
-        when, m["t"], m["kind"], m["from"], m["to"], ev)
+    ev = " [%s]" % tr["event"] if tr.get("event") else ""
+    t = "t=%7.2fs  " % tr["t"] if tr.get("t") is not None else ""
+    return "%s  %s%-7s %s -> %s%s" % (when, t, tr["kind"], tr["from"], tr["to"], ev)
 
 
 def main():
@@ -82,7 +100,7 @@ def main():
 
     if a.session is None:
         for s in sessions:
-            trs = s["transitions"]
+            trs = _normalize(s)
             t0 = time.strftime("%H:%M:%S", time.localtime(trs[0]["ts"]))
             t1 = time.strftime("%H:%M:%S", time.localtime(trs[-1]["ts"]))
             print("session %-3d %s - %s  %d transitions" % (s["id"], t0, t1, len(trs)))
@@ -91,7 +109,7 @@ def main():
     for s in sessions:
         if s["id"] != a.session:
             continue
-        trs = sorted(s["transitions"], key=lambda tr: tr["ts"])
+        trs = sorted(_normalize(s), key=lambda tr: tr["ts"])
         print("session %d  (%d transitions)\n" % (s["id"], len(trs)))
         for tr in trs:
             print(_label(tr))

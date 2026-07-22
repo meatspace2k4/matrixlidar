@@ -59,11 +59,14 @@ Events: `ENTRY_CONFIRMED`, `ENTRY_ABORTED`, `EXIT`, `GAP_RESET`. Design:
 Committed transitions are also reported back to the Pi (`bathroom/archive.py`
 sends `MARK` lines on the stream socket). The server snapshots its latest raw
 frame with each mark into a RAM ring (255 transitions), grouped into sessions
-by the room state. When a session closes it is appended to
-`~/lidar_sessions.jsonl` on the Pi as one JSON line (one write per session, not
-per frame), so sessions survive a crash or power cycle. `replay.py` fetches
-either source (`DUMP` for the live ring, `LOG` for the persisted sessions) and
-replays it by time.
+by the room state; this is live-viewing only and is lost on restart. When a
+session closes, its EVENTS (`ts`, `kind`, `from`, `to`, `event`, `boundary`,
+no sensor values) are appended to `~/lidar_sessions.jsonl` on the Pi as one
+JSON line (one write per session, not per frame), so the event history
+survives a crash or power cycle. `replay.py` fetches either source: `DUMP`
+for the live ring (replay renders each transition's frame as a grid), `LOG`
+for the persisted events (replay prints the event line only, no grid, since
+no frame is stored).
 
 ## Use
 
