@@ -14,7 +14,7 @@ import sys
 import time
 from collections import deque
 
-from . import config, detect, stream, sparkline
+from . import config, detect, occupancy, stream, sparkline
 from .engine import StateEngine
 from .zones import State
 
@@ -45,6 +45,7 @@ def main():
 
     baseline = config.load_baseline()
     eng = StateEngine(baseline=baseline, commit_after=args.commit_after)
+    room_eng = occupancy.OccupancyEngine()
     occ_hist = deque(maxlen=HIST)
     state_hist = deque(maxlen=HIST)
     col_hist = deque(maxlen=DRIFT_FRAMES)
@@ -54,6 +55,7 @@ def main():
             now = time.time()
             t0 = t0 if t0 is not None else now
             u = eng.update(m, now - t0)
+            ru = room_eng.update(u, now - t0)
             occ_hist.append(u.features["occ_count"])
             state_hist.append(u.committed)
             cells = u.features["occ_cells"]
@@ -63,6 +65,9 @@ def main():
                 col_hist.clear()
             door = detect.door_open_pct(m)
 
+            if ru.event is not None:
+                sys.stdout.write("\r\x1b[K%s  room -> %-9s (%s)\n"
+                                 % (time.strftime("%H:%M:%S"), ru.room, ru.event))
             if u.changed and u.event is not None:
                 sys.stdout.write("\r\x1b[K%s  %-18s -> %-18s (%.1fs)\n"
                                  % (time.strftime("%H:%M:%S"), u.event.state.name,
@@ -78,8 +83,10 @@ def main():
             shown = u.committed.name
             if u.committed == State.WALKING:
                 shown += _direction(col_hist)   # '<-' left / '->' right
-            sys.stdout.write("\r\x1b[K%-21s inst=%-18s door=%3.0f%% |%s| %s"
-                             % (shown, u.instant.name, door, spark, strip))
+            room_txt = "%s(%d) %s" % (ru.room, ru.occupants,
+                                      occupancy.fmt_duration((now - t0) - ru.since))
+            sys.stdout.write("\r\x1b[K%-20s %-21s inst=%-18s door=%3.0f%% |%s| %s"
+                             % (room_txt, shown, u.instant.name, door, spark, strip))
             sys.stdout.flush()
     except (KeyboardInterrupt, ConnectionError) as e:
         eng.close()

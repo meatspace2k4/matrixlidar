@@ -14,7 +14,7 @@ import sys
 import time
 from collections import deque
 
-from bathroom import config, detect, sparkline, stream
+from bathroom import config, detect, occupancy, sparkline, stream
 from bathroom.engine import StateEngine
 from bathroom.live import DRIFT_FRAMES, _direction
 from bathroom.zones import N, NO_TARGET, State, Zone
@@ -57,7 +57,7 @@ _hold = [[NO_TARGET] * N for _ in range(N)]       # last real value (display onl
 _stale = [[HOLD_FRAMES + 1] * N for _ in range(N)]  # frames since that value
 
 
-def render(m, state_name, occ_hist, state_hist):
+def render(m, state_name, room_txt, occ_hist, state_hist):
     out = ["\x1b[H", "\x1b[1m DFRobot Matrix Lidar  8x8 heatmap (cm)\x1b[0m\x1b[K\n\n"]
     for r in range(N):
         line = []
@@ -87,6 +87,7 @@ def render(m, state_name, occ_hist, state_hist):
         out.append("  %d %-9s %4d cm%s\x1b[K\n"
                    % (int(z), z.name, (v["median"] + 5) // 10, extra))
     out.append("\x1b[K\n \x1b[1mSTATE: %-22s\x1b[0m\x1b[K\n" % state_name)
+    out.append(" \x1b[1mROOM:  %-26s\x1b[0m\x1b[K\n" % room_txt)
     hi = max(8, max(occ_hist) if occ_hist else 8)
     out.append(" occ  |%s|\x1b[K\n" % sparkline.sparkline(occ_hist, lo=0, hi=hi))
     out.append(" time  %s\x1b[K\n" % sparkline.state_strip(state_hist))
@@ -103,6 +104,7 @@ def _waiting(attempt, total):
 def main():
     baseline = config.load_baseline()
     eng = StateEngine(baseline=baseline)
+    room_eng = occupancy.OccupancyEngine()
     occ_hist = deque(maxlen=HIST)
     state_hist = deque(maxlen=HIST)
     col_hist = deque(maxlen=DRIFT_FRAMES)
@@ -117,6 +119,7 @@ def main():
             now = time.time()
             t0 = t0 if t0 is not None else now
             u = eng.update(m, now - t0)
+            ru = room_eng.update(u, now - t0)
             occ_hist.append(u.features["occ_count"])
             state_hist.append(u.committed)
             cells = u.features["occ_cells"]
@@ -127,7 +130,9 @@ def main():
             shown = u.committed.name
             if u.committed == State.WALKING:
                 shown += _direction(col_hist)   # '<-' left / '->' right
-            render(m, shown, occ_hist, state_hist)
+            room_txt = "%s(%d) %s" % (ru.room, ru.occupants,
+                                      occupancy.fmt_duration((now - t0) - ru.since))
+            render(m, shown, room_txt, occ_hist, state_hist)
     except (KeyboardInterrupt, ConnectionError):
         pass
     finally:

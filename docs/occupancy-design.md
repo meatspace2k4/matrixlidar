@@ -48,8 +48,11 @@ stream → classify (posture, per frame) → StateEngine (debounced posture)
 
 ## 4. Track model
 
-Single-occupant assumption (it is a bathroom; multi-body is a stated
-non-goal). Per frame, the track is the centroid + bounding box of
+Single-track model: one centroid, so simultaneous bodies are not separable.
+Entries are individually observable (each is a door-side appear + penetration),
+so an entry while OCCUPIED increments an occupant count. Exits are deltas and
+cannot be attributed, so any exit empties the room (see section 5). Per frame,
+the track is the centroid + bounding box of
 `occ_cells`, smoothed over K=3 frames; velocity is centroid-column drift per
 second (the same computation the WALKING direction arrow uses). Track
 primitives:
@@ -78,8 +81,9 @@ instantly, but it can decay (that decay is the anti-latch).
 | EMPTY | MAYBE_OCCUPIED | any body evidence (instant ≠ EMPTY) |
 | MAYBE_OCCUPIED | OCCUPIED | `CROSS_IN` observed, or body persists ≥ `T_CONFIRM` |
 | MAYBE_OCCUPIED | EMPTY | anti-latch: evidence gone, total presence < `T_CONFIRM`, track never left `DOOR_BAND`, and `T_DECAY` of empty frames since |
-| OCCUPIED | EMPTY | exit only: `CROSS_OUT` then `T_EXIT_CONFIRM` of empty field (a pause at the door does not clear) |
+| OCCUPIED | EMPTY | exit only: ANY door-side vanish empties the room and zeroes the count, regardless of occupants (exits are deltas; they cannot be attributed) |
 | OCCUPIED | OCCUPIED | on `VANISH(left)` or `VANISH(mid)`: keep state, record `last_seen` side + time (I1) |
+| OCCUPIED | OCCUPIED | on a new `CROSS_IN`: occupants += 1 |
 | any | UNKNOWN | stream gap > `T_GAP` or server restart (I3) |
 
 Anti-latch cases mapped to the table:
@@ -140,5 +144,12 @@ boot into truly empty room (must stay UNKNOWN until first observed exit).
 
 ## 10. Non-goals
 
-Multi-occupant counting, fall detection, door% accuracy changes, any Pi-side
-or sensing changes.
+Counting bodies on exit (delta-only; any exit empties the room), fall
+detection, door% accuracy changes, any Pi-side or sensing changes.
+
+## 11. Implementation
+
+`bathroom/occupancy.py` implements sections 4, 5, and 7 with events
+`ENTRY_CONFIRMED`, `ENTRY_ABORTED`, `EXIT`, `GAP_RESET`; scenarios from
+section 9 are pinned in `tests/test_occupancy.py`. Section 6 (guarded
+recalibration, `RECALIBRATED`, `SENSOR_MOVED`) is not implemented.

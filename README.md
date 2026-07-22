@@ -45,14 +45,25 @@ Door state is separate: `open%` from column H (1090mm = 0%, >=1400mm = 100%).
 A body in the doorway splits the column; those frames hold the last coherent
 reading instead of moving the %. `doorcal.py` is the live calibration readout.
 
+### Room occupancy (`bathroom/occupancy.py`)
+
+A third layer on top of the posture engine: `UNKNOWN` / `EMPTY` / `OCCUPIED`,
+shown as the `ROOM:` line in both front-ends. The door is the only exit; any
+door-side vanish marks the room EMPTY (exits are deltas and cannot be counted).
+A vanish off the left FOV edge (sink/tub/shower) or mid-field keeps OCCUPIED.
+A door-side entry that penetrates the field while already occupied increments
+the occupant count. Boot and stream gaps are UNKNOWN, never assumed EMPTY.
+Events: `ENTRY_CONFIRMED`, `ENTRY_ABORTED`, `EXIT`, `GAP_RESET`. Design:
+`docs/occupancy-design.md`.
+
 ## Use
 
 Run from the repo root (so `import bathroom` resolves). Stdlib only for
 capture; `numpy` only for the training loader.
 
 ```
-python3 heatmap_client.py            # live heatmap (cm) + zone panel + STATE + sparkline
-python3 -m bathroom.live             # text live readout: state, door%, occupancy sparkline, state strip
+python3 heatmap_client.py            # live heatmap (cm) + zone panel + STATE + ROOM + sparkline
+python3 -m bathroom.live             # text live readout: room, state, door%, sparkline, state strip
 python3 -m bathroom.engine <clip>    # static render of a recorded clip (timeline + sparkline)
 ```
 
@@ -139,16 +150,17 @@ the engine and the frame classifier to score 1.0 on the labeled fixtures.
 ## Layout
 
 ```
-heatmap_client.py        live heatmap (cm) + zone panel + STATE + sparkline
+heatmap_client.py        live heatmap (cm) + zone panel + STATE + ROOM + sparkline
 doorcal.py               live door-panel readout for calibrating column H
 baselines/empty.json     empty-room reference for the classifier
-docs/occupancy-design.md room occupancy engine design (not yet implemented)
+docs/occupancy-design.md room occupancy engine design
 bathroom/
   zones.py               zones + State vocabulary + label aliases
   stream.py              warm-TCP reader -> oriented frames (auto-reconnect)
   detect.py              door open% + per-zone values
   classify.py            per-frame classifier (baseline-relative)
   engine.py              temporal state machine (debounce, timeline) + CLI
+  occupancy.py           room occupancy engine (UNKNOWN/EMPTY/OCCUPIED + events)
   sparkline.py           occupancy sparkline + colored state strip
   record.py              time-based labeled clip capture (CLI)
   live.py                live state readout (CLI)
