@@ -11,7 +11,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bathroom.classify import classify                # noqa: E402
+from bathroom.classify import classify
+from bathroom.detect import door_open_pct                # noqa: E402
 from bathroom.config import load_baseline             # noqa: E402
 from bathroom.occupancy import OccupancyEngine, RoomState  # noqa: E402
 from bathroom.stream import orient                    # noqa: E402
@@ -51,14 +52,17 @@ def replay_with_bridge(transitions, baseline):
         flat = [int(x) for x in frame_csv.split(",")]
         mat = orient([flat[i * 8:(i + 1) * 8] for i in range(8)])
         st, feats = classify(mat, baseline)
-        return Shim(st, feats)
+        # feed door% as the live clients do; without it the door-motion
+        # exit rule is structurally disabled and exits cannot replay
+        return Shim(st, feats), door_open_pct(mat)
 
     eng = OccupancyEngine()
     t0 = transitions[0]["ts"]
     events = []
 
-    def step(u, t):
-        ru = eng.update(u, t)
+    def step(pair, t):
+        u, pct = pair
+        ru = eng.update(u, t, door_pct=pct)
         if ru.event:
             events.append((ru.event, ru.room))
 
@@ -141,21 +145,25 @@ def main():
     if not check("ENTRY_CONFIRMED" in event_names_001,
                  "session_001: replay confirms the door entry"):
         failures.append("session_001 missing ENTRY_CONFIRMED")
-    # The EXIT itself is NOT re-derivable from transition snapshots: the
-    # door-side vanish decision needs the 1-2s doorward trajectory that only
-    # the live 10Hz stream contained, and bridging reconstructs presence
-    # duration, never trajectory (fabricating one would be synthetic data).
-    # The fixture's own recorded room marks are the live engine's attested
-    # behavior; assert the exit there. Full-stream clips (bathroom.record)
-    # are the tool that would make the exit replay-provable.
+    # The exit is replay-proven via the door-motion rule: the body cannot
+    # leave except through the door, and the captured frames record the door
+    # state changing after the vanish. This requires the replay to feed
+    # door_pct into update(), as the live clients do.
+    if not check("EXIT" in event_names_001,
+                 "session_001: replay derives the EXIT"):
+        failures.append("session_001 missing EXIT")
+    if not check(eng_001.room == RoomState.EMPTY,
+                 "session_001: final room is EMPTY"):
+        failures.append("session_001 room is %s, not EMPTY" % eng_001.room)
+    if not check(eng_001.occupants == 0,
+                 "session_001: final occupants = 0"):
+        failures.append("session_001 occupants = %d" % eng_001.occupants)
+    # and the live-recorded marks agree (attested live behavior)
     recorded_room = [tr["mark"] for tr in trs_001 if tr["mark"]["kind"] == "room"]
     if not check(any(m.get("event") == "EXIT" and m.get("to") == "EMPTY"
                      for m in recorded_room),
                  "session_001: live-recorded marks contain EXIT -> EMPTY"):
         failures.append("session_001 recorded marks missing EXIT")
-    if not check(any(m.get("event") == "ENTRY_CONFIRMED" for m in recorded_room),
-                 "session_001: live-recorded marks contain ENTRY_CONFIRMED"):
-        failures.append("session_001 recorded marks missing ENTRY_CONFIRMED")
 
     print("ALL PASS" if not failures else "SOME FAILED")
     return 1 if failures else 0
