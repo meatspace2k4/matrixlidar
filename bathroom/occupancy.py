@@ -17,8 +17,10 @@ Rules (operator semantics):
 - Boot and stream gaps are UNKNOWN, never EMPTY; only an observed exit (or a
   confirmed entry after quiet) leaves UNKNOWN.
 - Anti-latch: presence that never amounts to a real entry (hallway shimmer,
-  a vanish before T_CONFIRM without door penetration) decays back to EMPTY so
-  the EMPTY->OCCUPIED edge re-arms.
+  a mid-field artifact, a vanish without door penetration and below the
+  cumulative T_CONFIRM) decays back to the state the episode started from
+  (EMPTY stays EMPTY, UNKNOWN stays UNKNOWN) so the entry edge re-arms and
+  an unverified room is never promoted to a verified one.
 
 Internally there is a MAYBE phase (body evidence not yet confirmed); it is
 reported externally as OCCUPIED so consumers react instantly, but it can
@@ -37,7 +39,13 @@ class RoomState:
 
 
 class Params:
-    T_CONFIRM = 2.0      # presence needed to confirm occupancy without penetration
+    T_CONFIRM = 30.0     # CUMULATIVE presence needed to confirm occupancy
+                         # WITHOUT an observed door crossing. A door crossing
+                         # (CROSS_IN penetration) confirms instantly and does
+                         # not use this. 2.0s let a 7s mid-field artifact
+                         # latch OCCUPIED permanently (session 10); a real
+                         # body that never crossed the door (present at boot)
+                         # keeps producing evidence and still confirms.
     T_DECAY = 0.7        # quiet time before an unconfirmed MAYBE aborts
     T_ABSENT = 0.5       # sustained absence that ends a presence run (a vanish)
     T_GAP = 5.0          # stream gap that forces UNKNOWN
@@ -77,6 +85,10 @@ class OccupancyEngine:
         self.since = 0.0
         self._last_t = None
         self._maybe = False          # OCCUPIED reported but entry not confirmed
+        self._prior = RoomState.UNKNOWN  # room state before the current maybe
+                                     # episode; unconfirmed evidence decays
+                                     # BACK to this (UNKNOWN stays UNKNOWN:
+                                     # honest boot; EMPTY stays EMPTY)
         self._cent = deque(maxlen=Params.K)   # raw centroid cols, current run
         self._depth = deque(maxlen=Params.K)  # raw body depths (mm), current run
         self._track = []             # (t, smoothed_col, smoothed_mm) per frame
@@ -170,8 +182,13 @@ class OccupancyEngine:
             self._track.append((t, smoothed, smoothed_mm))
             run_len = t - self._run_start
 
-            if self.room == RoomState.EMPTY:
-                # evidence: report OCCUPIED immediately, confirm below
+            if not self._maybe and self.room in (RoomState.EMPTY,
+                                                 RoomState.UNKNOWN):
+                # evidence: report OCCUPIED immediately, confirm below.
+                # UNKNOWN takes the same maybe path as EMPTY: it must not
+                # hard-latch on unconfirmed evidence (session 10), and if the
+                # episode decays it returns to UNKNOWN, not EMPTY.
+                self._prior = self.room
                 self._maybe = True
                 self._run_presence = 0.0
                 self._set_room(RoomState.OCCUPIED, 1, t)
@@ -180,11 +197,6 @@ class OccupancyEngine:
             if self._maybe and (penetrated
                                 or self._run_presence + run_len >= Params.T_CONFIRM):
                 self._maybe = False
-                self._counted = True
-                event = "ENTRY_CONFIRMED"
-            elif self.room == RoomState.UNKNOWN and run_len >= Params.T_CONFIRM:
-                # present since boot: they never "entered", but they are here
-                self._set_room(RoomState.OCCUPIED, 1, t)
                 self._counted = True
                 event = "ENTRY_CONFIRMED"
             elif (self.room == RoomState.OCCUPIED and not self._maybe
@@ -221,7 +233,9 @@ class OccupancyEngine:
                     and self._maybe):
                 self._maybe = False
                 self._abort_at = None
-                self._set_room(RoomState.EMPTY, 0, t)
+                # decay to the state the episode started from, never assume
+                # EMPTY out of an UNKNOWN boot
+                self._set_room(self._prior, 0, t)
                 event = "ENTRY_ABORTED"
             # door-motion exit: the door does not move on its own. If the
             # field is empty, we are OCCUPIED, and the door open% has changed
