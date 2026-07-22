@@ -1,9 +1,8 @@
 """Ground-truth state classifier for the bathroom matrix lidar.
 
-This is the gap the existing code deferred (snapshot.py reported
-"Status: DEFERRED"). It turns an oriented 8x8 frame into one of the operator's
-labeled states (zones.State) deterministically and explainably, so it can serve
-as ground truth for recorded clips.
+Turns an oriented 8x8 frame into one of the labeled states (zones.State)
+deterministically and explainably, so it can serve as ground truth for
+recorded clips.
 
 How it decides
 --------------
@@ -21,12 +20,14 @@ the boundary failures an adversarial review surfaced (see tests/):
           cells, OR near cells spanning >=4 columns (so it is robust to the
           exact VNEAR cutoff: a body at ~650mm across the width still reads
           WALKING instead of flipping to STANDING).
-  STANDING upright body -> it occludes the TOP rows DEEPLY (>= DEEP_DELTA below
-          baseline). One deep top cell over a real body footprint is enough,
-          so a narrow/off-center stance is not misread as sitting.
-  SITTING low/seated body -> top stays at baseline (no deep top occlusion) while
-          occluded cells cluster low. The toilet zone alone is NOT sufficient
-          (door swing / dust on those 4 cells would otherwise read SITTING).
+  STANDING upright body -> it occludes the HEADROOM (top row) DEEPLY
+          (>= DEEP_DELTA below baseline). One deep headroom cell over a real
+          body footprint is enough, so a narrow/off-center stance is not
+          misread as sitting. Row 1 only: a seated body leaning forward
+          reaches row 2, so row 2 must not count as standing.
+  SITTING low/seated body -> headroom stays at baseline (no deep top-row
+          occlusion) while occluded cells cluster low. The toilet zone alone
+          is NOT sufficient (door swing / dust would otherwise read SITTING).
   UNKNOWN a body is present but matches no posture cleanly. Returned instead of
           a confident wrong label, so auto-labels stay trustworthy as ground
           truth.
@@ -45,16 +46,23 @@ class Params:
     BASELINE_CAP = 1500     # no-target baseline cells capped here for delta math
     VNEAR_MM = 650          # "very near" => body essentially at the sensor lens
     VNEAR_MIN = 8           # WALKING via this many very-near cells
-    NEAR_SOFT = 850         # softer "near" band, used for the column-spread rule
+    NEAR_SOFT = 750         # softer "near" band, used for the column-spread rule
+                            # (750, not 850: a body standing off-toilet at
+                            # ~800mm must not read as WALKING)
     NEAR_MIN = 10           # WALKING via this many near cells ...
     NEAR_COLS_MIN = 4       # ... spread across at least this many columns
     EMPTY_MAX = 2           # EMPTY if at most this many occupied cells
     NOISE_MAX = 4           # a cluster this small that fits in a 2x2 box is noise
     MIN_BODY = 5            # fewer occupied cells than this is not a posture
-    UPPER_ROWS = (0, 1)     # the top of the field (occluded when upright)
+    UPPER_ROWS = (0,)       # the HEADROOM row: standing removes it; a seated
+                            # body leaning forward reaches row 2 but not row 1
     LOWER_ROWS = (5, 6, 7)  # the bottom of the field (occluded when seated)
     DEEP_UPPER_MIN = 1      # STANDING needs this many deeply-occluded top cells
     LOWER_MIN = 3           # SITTING needs this many occupied bottom cells
+    TORSO_ROWS = (2, 3, 4, 5)  # middle rows: a standing head has a torso here
+    TORSO_MIN = 2           # occupied middle cells (same/adjacent col) under a
+                            # deep head cell before it counts as STANDING; a
+                            # seated head leaned near the lens has none
 
 
 # Default empty-room baseline: the labeled door-CLOSED capture
@@ -113,9 +121,18 @@ def features(matrix, baseline=None):
 
     occ_rows = sorted({r for (r, _c) in occ})
     occ_cols = sorted({c for (_r, c) in occ})
+    occ_set = set(occ)
     upper = [rc for rc in occ if rc[0] in Params.UPPER_ROWS]
     lower = [rc for rc in occ if rc[0] in Params.LOWER_ROWS]
     deep_upper = [rc for rc in upper if rc in deep]
+    # a deep head cell is only a STANDING signal if a torso is under it:
+    # occupied middle-row cells in the same or adjacent column. A seated body
+    # leaning its head near the lens shows a deep top cell with nothing below.
+    deep_upper_supported = [
+        (r0, c0) for (r0, c0) in deep_upper
+        if sum(1 for rr in Params.TORSO_ROWS for cc in (c0 - 1, c0, c0 + 1)
+               if 0 <= cc < N and (rr, cc) in occ_set) >= Params.TORSO_MIN
+    ]
     near_cols = {c for (_r, c) in near_cells}
     occ_mm = [matrix[r][c] for (r, c) in occ]
     noise_cluster = (
@@ -131,6 +148,7 @@ def features(matrix, baseline=None):
         "near_cols": len(near_cols),
         "upper_count": len(upper),
         "deep_upper": len(deep_upper),
+        "deep_upper_supported": len(deep_upper_supported),
         "lower_count": len(lower),
         "toto_occluded": any(rc in occ for rc in ZONE_CELLS[Zone.TOTO]),
         "noise_cluster": noise_cluster,
@@ -164,11 +182,13 @@ def classify(matrix, baseline=None):
     # below WALKING but too little structure to call a posture
     if f["occ_count"] < Params.MIN_BODY:
         return State.UNKNOWN, f
-    # STANDING: upright body occludes the top rows DEEPLY.
-    if f["deep_upper"] >= Params.DEEP_UPPER_MIN:
+    # STANDING: upright body occludes the headroom DEEPLY, with a torso below.
+    if f["deep_upper_supported"] >= Params.DEEP_UPPER_MIN:
         return State.STANDING_AT_TOILET, f
-    # SITTING: low body, top clear (no deep top occlusion), bottom occupied.
-    if f["lower_count"] >= Params.LOWER_MIN and f["deep_upper"] == 0:
+    # SITTING: low body, no supported head-over-torso signal, bottom occupied.
+    # An unsupported deep top cell (seated head leaned near the lens) does not
+    # block SITTING.
+    if f["lower_count"] >= Params.LOWER_MIN and f["deep_upper_supported"] == 0:
         return State.SITTING_AT_TOILET, f
     return State.UNKNOWN, f
 

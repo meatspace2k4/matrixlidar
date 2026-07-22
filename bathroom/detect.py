@@ -11,7 +11,7 @@ from .zones import Zone, ZONE_CELLS
 # Door swing reads on column H from 1000mm (shut) to 1400mm. Past 1400 the door
 # has swung clear and the sensor sees through (up to 4000/no-target), still
 # fully open -> the >=1400 clamp maps it to 100%.
-DOOR_CLOSED_MM = 1000
+DOOR_CLOSED_MM = 1090
 DOOR_OPEN_MM = 1400
 
 

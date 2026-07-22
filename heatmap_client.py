@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Local heatmap client. Connects to the Pi's always-on warm stream
-(bath-pi.local:8628), renders the 8x8 heatmap + zone panel LOCALLY, and now
-also shows the live ground-truth STATE from the classifier so you can see
-what a recording is being labeled as while you capture it.
+(bath-pi.local:8628) and renders locally: the 8x8 heatmap (cell values in cm,
+brief dropouts held for display), the zone panel with door open%, the debounced
+STATE (with a <- / -> direction arrow while WALKING), and the occupancy
+sparkline + state strip.
 
 Only the tiny raw frames cross the network; the per-frame ANSI repaint happens
 on this machine. Run from the project root so `import bathroom` resolves:
@@ -15,7 +16,8 @@ from collections import deque
 
 from bathroom import config, detect, sparkline, stream
 from bathroom.engine import StateEngine
-from bathroom.zones import N, NO_TARGET, Zone
+from bathroom.live import DRIFT_FRAMES, _direction
+from bathroom.zones import N, NO_TARGET, State, Zone
 
 NEAR_MM = 100
 FAR_MM = 2000
@@ -50,15 +52,27 @@ def color_for(mm):
     return STOPS[-1][1]
 
 
-def render(m, state, occ_hist, state_hist):
-    out = ["\x1b[H", "\x1b[1m DFRobot Matrix Lidar  8x8 heatmap (mm)\x1b[0m\x1b[K\n\n"]
+HOLD_FRAMES = 6  # bridge dropouts this long; beyond it the cell is truly empty
+_hold = [[NO_TARGET] * N for _ in range(N)]       # last real value (display only)
+_stale = [[HOLD_FRAMES + 1] * N for _ in range(N)]  # frames since that value
+
+
+def render(m, state_name, occ_hist, state_hist):
+    out = ["\x1b[H", "\x1b[1m DFRobot Matrix Lidar  8x8 heatmap (cm)\x1b[0m\x1b[K\n\n"]
     for r in range(N):
         line = []
         for c in range(N):
-            v = m[r][c]
+            raw = m[r][c]
+            if 0 < raw < NO_TARGET:     # 0 = dust/noise, never a real reading
+                _hold[r][c], _stale[r][c] = raw, 0
+            else:
+                _stale[r][c] += 1
+            # brief dropout: show the held value; persistently empty (open
+            # doorway, hallway out of range): show truly blank
+            v = _hold[r][c] if _stale[r][c] <= HOLD_FRAMES else NO_TARGET
             br, bg, bb = color_for(v)
             fg = "30" if v < FAR_MM and v < NEAR_MM + 900 else "97"
-            txt = "" if v >= NO_TARGET else str(v)
+            txt = "" if v >= NO_TARGET else str((v + 5) // 10)  # shown in cm
             line.append("\x1b[48;2;%d;%d;%dm\x1b[%sm%s\x1b[0m"
                         % (br, bg, bb, fg, txt.center(CELL_W)))
         out.append("".join(line) + "\x1b[K\n")
@@ -67,11 +81,12 @@ def render(m, state, occ_hist, state_hist):
         br, bg, bb = color_for(mm)
         out.append("\x1b[48;2;%d;%d;%dm   \x1b[0m" % (br, bg, bb))
     out.append(" far/none\x1b[K\n\x1b[K\n")
-    for z in (Zone.TOTO, Zone.DOOR, Zone.LEFT_EDGE):
+    for z in (Zone.TOTO, Zone.DOOR, Zone.FRAME):
         v = detect.zone_values(m, z)
         extra = "  open=%.0f%%" % detect.door_open_pct(m) if z == Zone.DOOR else ""
-        out.append("  %d %-9s %4d mm%s\x1b[K\n" % (int(z), z.name, v["median"], extra))
-    out.append("\x1b[K\n \x1b[1mSTATE: %-20s\x1b[0m\x1b[K\n" % state.name)
+        out.append("  %d %-9s %4d cm%s\x1b[K\n"
+                   % (int(z), z.name, (v["median"] + 5) // 10, extra))
+    out.append("\x1b[K\n \x1b[1mSTATE: %-22s\x1b[0m\x1b[K\n" % state_name)
     hi = max(8, max(occ_hist) if occ_hist else 8)
     out.append(" occ  |%s|\x1b[K\n" % sparkline.sparkline(occ_hist, lo=0, hi=hi))
     out.append(" time  %s\x1b[K\n" % sparkline.state_strip(state_hist))
@@ -90,6 +105,7 @@ def main():
     eng = StateEngine(baseline=baseline)
     occ_hist = deque(maxlen=HIST)
     state_hist = deque(maxlen=HIST)
+    col_hist = deque(maxlen=DRIFT_FRAMES)
     started = False
     t0 = None
     try:
@@ -103,7 +119,15 @@ def main():
             u = eng.update(m, now - t0)
             occ_hist.append(u.features["occ_count"])
             state_hist.append(u.committed)
-            render(m, u.committed, occ_hist, state_hist)
+            cells = u.features["occ_cells"]
+            if cells:
+                col_hist.append(sum(c for _r, c in cells) / float(len(cells)))
+            else:
+                col_hist.clear()
+            shown = u.committed.name
+            if u.committed == State.WALKING:
+                shown += _direction(col_hist)   # '<-' left / '->' right
+            render(m, shown, occ_hist, state_hist)
     except (KeyboardInterrupt, ConnectionError):
         pass
     finally:

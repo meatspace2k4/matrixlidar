@@ -17,8 +17,12 @@ from .zones import N
 HOST = "bath-pi.local"
 PORT = 8628
 CONNECT_TIMEOUT = 2.0
+READ_TIMEOUT = 5.0  # frames arrive ~10/s; silence this long means a stalled
+                    # link (e.g. wake-from-sleep) -> drop and reconnect
 RETRY_DELAY = 1.0
 MAX_ATTEMPTS = 60  # ~ covers a full Pi reboot
+
+_cached_ip = None  # last good peer IP; skips slow .local mDNS on reconnects
 
 
 def rotate_cw(m):
@@ -43,14 +47,23 @@ def _to_matrix(flat):
 
 
 def connect_with_retry(host=HOST, port=PORT, on_wait=None):
-    """Return a connected socket, or None after MAX_ATTEMPTS. Never raises."""
+    """Return a connected socket, or None after MAX_ATTEMPTS. Never raises.
+
+    The socket carries READ_TIMEOUT so a connection that goes silent (stalled
+    server, wake-from-sleep) raises instead of hanging the render loop."""
+    global _cached_ip
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            return socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
-        except OSError:
-            if on_wait:
-                on_wait(attempt, MAX_ATTEMPTS)
-            time.sleep(RETRY_DELAY)
+        for target in ([_cached_ip] if _cached_ip else []) + [host]:
+            try:
+                s = socket.create_connection((target, port), timeout=CONNECT_TIMEOUT)
+                _cached_ip = s.getpeername()[0]
+                s.settimeout(READ_TIMEOUT)
+                return s
+            except OSError:
+                continue
+        if on_wait:
+            on_wait(attempt, MAX_ATTEMPTS)
+        time.sleep(RETRY_DELAY)
     return None
 
 

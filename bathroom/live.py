@@ -5,8 +5,9 @@ rolling occupancy sparkline and a colored state strip.
   python3 -m bathroom.live --verbose    # also log each committed transition
 
 State transitions are logged to scrollback as they commit; the bottom line
-rewrites in place with the current state, door%, the occupancy sparkline, and
-the recent state strip. On exit it prints the session timeline.
+rewrites in place with the current state (plus a <- / -> direction arrow while
+WALKING), door%, the occupancy sparkline, and the recent state strip. On exit
+it prints the session timeline.
 """
 import argparse
 import sys
@@ -15,8 +16,23 @@ from collections import deque
 
 from . import config, detect, stream, sparkline
 from .engine import StateEngine
+from .zones import State
 
 HIST = 32  # columns of rolling history in the sparkline + state strip
+DRIFT_FRAMES = 6    # centroid-column history for walking direction
+DRIFT_MIN = 0.8     # columns of net drift before a direction is claimed
+
+
+def _direction(col_hist):
+    """'<-' (leftward), '->' (rightward), or '' from centroid-column drift."""
+    if len(col_hist) < DRIFT_FRAMES:
+        return ""
+    drift = col_hist[-1] - col_hist[0]
+    if drift <= -DRIFT_MIN:
+        return " <-"
+    if drift >= DRIFT_MIN:
+        return " ->"
+    return ""
 
 
 def main():
@@ -31,6 +47,7 @@ def main():
     eng = StateEngine(baseline=baseline, commit_after=args.commit_after)
     occ_hist = deque(maxlen=HIST)
     state_hist = deque(maxlen=HIST)
+    col_hist = deque(maxlen=DRIFT_FRAMES)
     t0 = None
     try:
         for m in stream.frames(on_wait=_waiting):
@@ -39,6 +56,11 @@ def main():
             u = eng.update(m, now - t0)
             occ_hist.append(u.features["occ_count"])
             state_hist.append(u.committed)
+            cells = u.features["occ_cells"]
+            if cells:
+                col_hist.append(sum(c for _r, c in cells) / float(len(cells)))
+            else:
+                col_hist.clear()
             door = detect.door_open_pct(m)
 
             if u.changed and u.event is not None:
@@ -53,8 +75,11 @@ def main():
 
             spark = sparkline.sparkline(occ_hist, lo=0, hi=max(8, max(occ_hist)))
             strip = sparkline.state_strip(state_hist)
-            sys.stdout.write("\r\x1b[K%-18s inst=%-18s door=%3.0f%% |%s| %s"
-                             % (u.committed.name, u.instant.name, door, spark, strip))
+            shown = u.committed.name
+            if u.committed == State.WALKING:
+                shown += _direction(col_hist)   # '<-' left / '->' right
+            sys.stdout.write("\r\x1b[K%-21s inst=%-18s door=%3.0f%% |%s| %s"
+                             % (shown, u.instant.name, door, spark, strip))
             sys.stdout.flush()
     except (KeyboardInterrupt, ConnectionError) as e:
         eng.close()

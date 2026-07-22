@@ -13,12 +13,13 @@ Named regions (operator-supplied geometry, small bathroom):
   DOOR       = entire column H (the far-right range). Closed -> door panel
                ~1000-1160mm; open -> sensor sees into the hallway, ~1400 up to
                4000/no-target. Column G is the jamb/handle, NOT the door.
-  LEFT_EDGE  = column A (sink/tub/shower out of frame to the left; a body
+  FRAME  = column A (sink/tub/shower out of frame to the left; a body
                entering from that side first appears here)
 
-This file is kept byte-for-byte in sync with the Pi's bathroom/zones.py up to
-the State enum, which here carries the operator's posture/position ground-truth
-vocabulary (the thing the classifier reports), not the deferred temporal phases.
+The Pi's bathroom/zones.py shares the same geometry and orientation contract
+but has diverged in naming (it still calls column A LEFT_EDGE) and does not
+carry the State enum, which here is the posture/position ground-truth
+vocabulary the classifier reports.
 """
 from enum import IntEnum
 
@@ -34,7 +35,7 @@ class Zone(IntEnum):
     NONE = 0       # no blob / empty
     TOTO = 1       # toilet
     DOOR = 2       # door column
-    LEFT_EDGE = 3  # leftmost column, sink/tub/shower side
+    FRAME = 3  # leftmost column, sink/tub/shower side
     FIELD = 4      # anywhere else in view
 
 
@@ -77,7 +78,7 @@ ALL_ROWS = [1, 2, 3, 4, 5, 6, 7, 8]
 ZONE_CELLS = {
     Zone.TOTO: _cells(["B", "C"], [7, 8]),
     Zone.DOOR: _cells(["H"], ALL_ROWS),
-    Zone.LEFT_EDGE: _cells(["A"], ALL_ROWS),
+    Zone.FRAME: _cells(["A"], ALL_ROWS),
 }
 
 DOOR_COL = _col("H")  # presence detection ignores this column (door swing != body)
