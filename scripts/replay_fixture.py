@@ -39,6 +39,7 @@ def load_stack(root):
         classify = importlib.import_module("bathroom.classify")
         occupancy = importlib.import_module("bathroom.occupancy")
         stream = importlib.import_module("bathroom.stream")
+        detect = importlib.import_module("bathroom.detect")
         config = importlib.import_module("bathroom.config")
         baseline = config.load_baseline()
     finally:
@@ -47,7 +48,7 @@ def load_stack(root):
             if k.startswith("bathroom"):
                 del sys.modules[k]
         sys.modules.update(saved)
-    return classify, occupancy, stream, baseline
+    return classify, occupancy, stream, detect, baseline
 
 
 class Shim:
@@ -73,7 +74,7 @@ def main():
                          "continuous evidence between them)")
     a = ap.parse_args()
 
-    classify_m, occupancy_m, stream_m, baseline = load_stack(a.code_root)
+    classify_m, occupancy_m, stream_m, detect_m, baseline = load_stack(a.code_root)
     with open(a.fixture) as f:
         s = json.load(f)
     trs = sorted(s["transitions"], key=lambda tr: tr["ts"])
@@ -81,18 +82,21 @@ def main():
         print("fixture has no transitions")
         return 1
 
-    def to_update(frame_csv, detect_pct=False):
+    def to_update(frame_csv):
         flat = [int(x) for x in frame_csv.split(",")]
         mat = stream_m.orient([flat[i * 8:(i + 1) * 8] for i in range(8)])
         st, feats = classify_m.classify(mat, baseline)
-        return Shim(st, feats)
+        # feed door% exactly as the live clients do; without it the engine's
+        # door-motion exit rule is structurally disabled in replay
+        return Shim(st, feats), detect_m.door_open_pct(mat)
 
     eng = occupancy_m.OccupancyEngine()
     t0 = trs[0]["ts"]
     events = []
 
-    def step(u, t):
-        ru = eng.update(u, t)
+    def step(pair, t):
+        u, door_pct = pair
+        ru = eng.update(u, t, door_pct=door_pct)
         if ru.event:
             events.append((t, ru.event, ru.room))
 
