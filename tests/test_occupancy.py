@@ -10,8 +10,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bathroom.occupancy import OccupancyEngine, RoomState   # noqa: E402
-from bathroom.zones import State                            # noqa: E402
+from bathroom.occupancy import OccupancyEngine, Params, RoomState  # noqa: E402
+from bathroom.zones import State                                   # noqa: E402
 
 HZ = 10.0
 
@@ -78,11 +78,12 @@ def main():
     _, ev = drive(e, 0.0, [(4.0, None, None)])
     check(e.room == RoomState.UNKNOWN and not ev, "quiet boot stays UNKNOWN")
 
-    # boot with a person mid-room: OCCUPIED after T_CONFIRM; door exit empties
+    # boot with a person mid-room: OCCUPIED only after sustained cumulative
+    # evidence (T_CONFIRM; no door crossing available); door exit empties
     e = OccupancyEngine()
-    t, ev = drive(e, 0.0, [(3.0, 3, 1200)])
+    t, ev = drive(e, 0.0, [(Params.T_CONFIRM + 1.0, 3, 1200)])
     check(e.room == RoomState.OCCUPIED and e.occupants == 1
-          and "ENTRY_CONFIRMED" in ev, "boot with person -> OCCUPIED")
+          and "ENTRY_CONFIRMED" in ev, "boot with person -> OCCUPIED (sustained)")
     t, ev = drive(e, t, [(1.0, (3, 6), (1200, 1050)), (1.5, None, None)])
     check(e.room == RoomState.EMPTY and e.occupants == 0 and "EXIT" in ev,
           "walk to door (receding depth) + vanish -> EMPTY")
@@ -129,11 +130,12 @@ def main():
     check(e.room == RoomState.EMPTY and e.occupants == 0 and "EXIT" in ev,
           "any exit -> EMPTY (delta rule)")
 
-    # stream gap: forces UNKNOWN
+    # stream gap: forces UNKNOWN (probed with an empty frame; evidence on the
+    # gap frame would by design immediately re-report maybe-OCCUPIED)
     e = OccupancyEngine()
     e.room = RoomState.EMPTY
     t, _ = drive(e, 0.0, [(0.4, 6, 1050), (0.8, (6, 3), (1050, 700))])
-    ru = e.update(FakeUpdate(3, 700), t + 10.0)
+    ru = e.update(FakeUpdate(None), t + 10.0)
     check(ru.room == RoomState.UNKNOWN and ru.event == "GAP_RESET",
           "stream gap -> UNKNOWN")
 
