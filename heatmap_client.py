@@ -120,7 +120,8 @@ def main():
             now = time.time()
             t0 = t0 if t0 is not None else now
             u = eng.update(m, now - t0)
-            ru = room_eng.update(u, now - t0)
+            ru = room_eng.update(u, now - t0,
+                                 door_pct=detect.door_open_pct(m))
             marker.update(u, ru, now - t0)
             occ_hist.append(u.features["occ_count"])
             state_hist.append(u.committed)

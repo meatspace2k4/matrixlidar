@@ -56,7 +56,8 @@ def main():
             now = time.time()
             t0 = t0 if t0 is not None else now
             u = eng.update(m, now - t0)
-            ru = room_eng.update(u, now - t0)
+            door = detect.door_open_pct(m)
+            ru = room_eng.update(u, now - t0, door_pct=door)
             marker.update(u, ru, now - t0)
             occ_hist.append(u.features["occ_count"])
             state_hist.append(u.committed)
@@ -65,7 +66,6 @@ def main():
                 col_hist.append(sum(c for _r, c in cells) / float(len(cells)))
             else:
                 col_hist.clear()
-            door = detect.door_open_pct(m)
 
             if ru.event is not None:
                 sys.stdout.write("\r\x1b[K%s  room -> %-9s (%s)\n"

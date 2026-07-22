@@ -63,6 +63,20 @@ class Params:
     TORSO_MIN = 2           # occupied middle cells (same/adjacent col) under a
                             # deep head cell before it counts as STANDING; a
                             # seated head leaned near the lens has none
+    # depth (the frame is a ToF depth map, not a flat grid):
+    HEAD_ROWS = (0, 1, 2)   # upper region for the body-relative headroom test
+    BODY_DEPTH_TOL = 250    # a cell within this of the body's median depth is
+                            # part of the same body plane. Upper-region cells at
+                            # BODY depth = the body reaches the top of the FOV
+                            # (standing), even when the absolute depression is
+                            # too shallow for DEEP_DELTA (a body ~1m out over a
+                            # ~1.2-1.4m baseline). A seated body has at most a
+                            # leaning head there.
+    UPPER_BODY_MIN = 2      # this many body-plane upper cells => STANDING
+    SEAT_TOL = 120          # a seated body reads at the SEAT's depth (the
+                            # fixture's own baseline); a body standing on the
+                            # floor beside the fixture is systematically
+                            # closer. Sitting requires |body - seat| <= this.
 
 
 # Default empty-room baseline: the labeled door-CLOSED capture
@@ -135,6 +149,23 @@ def features(matrix, baseline=None):
     ]
     near_cols = {c for (_r, c) in near_cells}
     occ_mm = [matrix[r][c] for (r, c) in occ]
+    # body depth: median distance of the occluding body itself
+    body_mm = int(statistics.median(occ_mm)) if occ_mm else None
+    # body-relative headroom: upper-region cells occupied AT the body's depth
+    # (same physical plane). Nonzero => the body extends to the top of the FOV.
+    upper_body = 0
+    if body_mm is not None:
+        upper_body = sum(1 for (r, c) in occ
+                         if r in Params.HEAD_ROWS
+                         and abs(matrix[r][c] - body_mm) <= Params.BODY_DEPTH_TOL)
+    # does the lower cluster overlap the toilet fixture (positional gate)?
+    toto = set(ZONE_CELLS[Zone.TOTO])
+    lower_at_fixture = sum(1 for rc in lower if rc in toto)
+    # the fixture's own depth from the baseline (median lands on the seat
+    # cells); a seated body must read at this depth, a floor-stander cannot
+    seat_mm = int(statistics.median(_eff_base(base[r][c]) for (r, c) in toto))
+    body_at_seat = (body_mm is not None
+                    and abs(body_mm - seat_mm) <= Params.SEAT_TOL)
     noise_cluster = (
         0 < len(occ) <= Params.NOISE_MAX
         and (max(occ_rows) - min(occ_rows) <= 1)
@@ -150,6 +181,11 @@ def features(matrix, baseline=None):
         "deep_upper": len(deep_upper),
         "deep_upper_supported": len(deep_upper_supported),
         "lower_count": len(lower),
+        "body_mm": body_mm,
+        "upper_body": upper_body,
+        "lower_at_fixture": lower_at_fixture,
+        "seat_mm": seat_mm,
+        "body_at_seat": body_at_seat,
         "toto_occluded": any(rc in occ for rc in ZONE_CELLS[Zone.TOTO]),
         "noise_cluster": noise_cluster,
         "row_spread": (max(occ_rows) - min(occ_rows) + 1) if occ_rows else 0,
@@ -182,13 +218,22 @@ def classify(matrix, baseline=None):
     # below WALKING but too little structure to call a posture
     if f["occ_count"] < Params.MIN_BODY:
         return State.UNKNOWN, f
-    # STANDING: upright body occludes the headroom DEEPLY, with a torso below.
-    if f["deep_upper_supported"] >= Params.DEEP_UPPER_MIN:
+    # STANDING: upright body occludes the headroom DEEPLY with a torso below,
+    # OR (depth path) the body plane itself reaches the upper FOV: two or more
+    # upper-region cells at the body's own depth. The depth path catches a
+    # standing body ~1m out whose absolute depression is too shallow for
+    # DEEP_DELTA (the mirror-use misdetection).
+    if (f["deep_upper_supported"] >= Params.DEEP_UPPER_MIN
+            or f["upper_body"] >= Params.UPPER_BODY_MIN):
         return State.STANDING_AT_TOILET, f
-    # SITTING: low body, no supported head-over-torso signal, bottom occupied.
-    # An unsupported deep top cell (seated head leaned near the lens) does not
-    # block SITTING.
-    if f["lower_count"] >= Params.LOWER_MIN and f["deep_upper_supported"] == 0:
+    # SITTING is positional AND depth-consistent: bottom occupied, the lower
+    # cluster overlaps the toilet fixture, the body reads at the SEAT's depth
+    # (a floor-stander beside the fixture is systematically closer), and the
+    # headroom is clear (no supported deep top cell; at most a leaning head
+    # at body depth). "Any body with headroom" is no longer sitting.
+    if (f["lower_count"] >= Params.LOWER_MIN and f["deep_upper_supported"] == 0
+            and f["upper_body"] <= 1 and f["lower_at_fixture"] >= 1
+            and f["body_at_seat"]):
         return State.SITTING_AT_TOILET, f
     return State.UNKNOWN, f
 
