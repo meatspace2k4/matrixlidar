@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Fetch the Pi's in-memory transition archive and replay it.
+"""Fetch the Pi's transition archive and replay it.
 
 The server keeps raw-frame snapshots of committed transitions (see
-bathroom/archive.py), grouped into sessions. This rebuilds the timeline by
-time and replays the snapshots on the client, rendered like the live heatmap.
+bathroom/archive.py) in a RAM ring, and appends each session to a JSON-lines
+log on disk when it closes. This rebuilds the timeline by time and replays the
+snapshots on the client, rendered like the live heatmap.
 
-  python3 replay.py                  # list sessions
-  python3 replay.py --session 3      # replay one session's snapshots
+  python3 replay.py                  # list sessions in the live RAM ring
+  python3 replay.py --log            # list sessions from the persisted log
+  python3 replay.py --log --session 3
   python3 replay.py --session 3 --delay 0.8
 """
 import argparse
@@ -19,12 +21,12 @@ from bathroom.zones import N, NO_TARGET
 from heatmap_client import CELL_W, color_for
 
 
-def fetch(host=stream.HOST, port=stream.PORT):
+def fetch(host=stream.HOST, port=stream.PORT, query=b"DUMP"):
     sock = stream.connect_with_retry(host, port)
     if sock is None:
         raise ConnectionError("could not reach %s:%d" % (host, port))
     try:
-        sock.sendall(b"DUMP\n")
+        sock.sendall(query + b"\n")
         with sock.makefile("r") as f:
             for line in f:
                 if line.startswith("ARCHIVE "):
@@ -66,11 +68,16 @@ def main():
     ap.add_argument("--session", type=int, help="replay this session id")
     ap.add_argument("--delay", type=float, default=0.0,
                     help="pause between snapshots (seconds)")
+    ap.add_argument("--log", action="store_true",
+                    help="read the persisted session log instead of the RAM ring")
+    ap.add_argument("--count", type=int, default=20,
+                    help="with --log, how many recent sessions to fetch")
     a = ap.parse_args()
-    dump = fetch()
+    query = ("LOG %d" % a.count).encode() if a.log else b"DUMP"
+    dump = fetch(query=query)
     sessions = dump["sessions"]
     if not sessions:
-        print("archive is empty")
+        print("%s is empty" % ("session log" if a.log else "RAM archive"))
         return 0
 
     if a.session is None:

@@ -58,9 +58,12 @@ Events: `ENTRY_CONFIRMED`, `ENTRY_ABORTED`, `EXIT`, `GAP_RESET`. Design:
 
 Committed transitions are also reported back to the Pi (`bathroom/archive.py`
 sends `MARK` lines on the stream socket). The server snapshots its latest raw
-frame with each mark into an in-memory ring (255 transitions, RAM only,
-nothing on the SD card), grouped into sessions by the room state. `replay.py`
-fetches the archive (`DUMP`) and replays it by time.
+frame with each mark into a RAM ring (255 transitions), grouped into sessions
+by the room state. When a session closes it is appended to
+`~/lidar_sessions.jsonl` on the Pi as one JSON line (one write per session, not
+per frame), so sessions survive a crash or power cycle. `replay.py` fetches
+either source (`DUMP` for the live ring, `LOG` for the persisted sessions) and
+replays it by time.
 
 ## Use
 
@@ -71,8 +74,9 @@ capture; `numpy` only for the training loader.
 python3 heatmap_client.py            # live heatmap (cm) + zone panel + STATE + ROOM + sparkline
 python3 -m bathroom.live             # text live readout: room, state, door%, sparkline, state strip
 python3 -m bathroom.engine <clip>    # static render of a recorded clip (timeline + sparkline)
-python3 replay.py                    # list archived transition sessions (from the Pi's RAM ring)
-python3 replay.py --session N        # replay one session's raw-frame snapshots by time
+python3 replay.py                    # list transition sessions in the Pi's RAM ring
+python3 replay.py --log              # list sessions from the Pi's persisted log
+python3 replay.py [--log] --session N # replay one session's raw-frame snapshots by time
 ```
 
 ### Capture labeled clips
