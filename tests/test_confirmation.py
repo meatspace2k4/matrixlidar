@@ -135,7 +135,10 @@ def main():
     t, _ = drive(e, 0.0, [(0.4, 6, 1050), (0.8, (6, 3), (1050, 700))])
     check(e.room == RoomState.OCCUPIED,
           "7a: door entry establishes OCCUPIED")
-    t, ev = drive(e, t, [(0.5, (3, 5), (700, 950)), (1.5, None, None)])
+    # trajectory must actually reach the door band (smoothed centroid >=
+    # DOOR_COL) at door-plane depth; a ramp topping out below FIELD_COL is a
+    # mid-field vanish and correctly does NOT exit
+    t, ev = drive(e, t, [(0.8, (3, 6), (700, 1050)), (1.5, None, None)])
     check(e.room == RoomState.EMPTY and "EXIT" in ev,
           "7b: confirmed OCCUPIED + door-side vanish (depth >= 900) -> EXIT")
 
@@ -146,7 +149,9 @@ def main():
     t, _ = drive(e, 0.0, [(0.4, 6, 1050), (0.8, (6, 3), (1050, 700))])
     check(e.room == RoomState.OCCUPIED,
           "8a: door entry confirms OCCUPIED")
-    ru = e.update(FakeUpdate(3, 700), t + Params.T_GAP + 1.0)
+    # probe the gap with an EMPTY frame: evidence on the gap frame would
+    # (by design) immediately re-report maybe-OCCUPIED from UNKNOWN
+    ru = e.update(FakeUpdate(None), t + Params.T_GAP + 1.0)
     check(ru.room == RoomState.UNKNOWN and ru.event == "GAP_RESET",
           "8b: gap > T_GAP resets to UNKNOWN with GAP_RESET")
 

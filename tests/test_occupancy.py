@@ -130,11 +130,12 @@ def main():
     check(e.room == RoomState.EMPTY and e.occupants == 0 and "EXIT" in ev,
           "any exit -> EMPTY (delta rule)")
 
-    # stream gap: forces UNKNOWN
+    # stream gap: forces UNKNOWN (probed with an empty frame; evidence on the
+    # gap frame would by design immediately re-report maybe-OCCUPIED)
     e = OccupancyEngine()
     e.room = RoomState.EMPTY
     t, _ = drive(e, 0.0, [(0.4, 6, 1050), (0.8, (6, 3), (1050, 700))])
-    ru = e.update(FakeUpdate(3, 700), t + 10.0)
+    ru = e.update(FakeUpdate(None), t + 10.0)
     check(ru.room == RoomState.UNKNOWN and ru.event == "GAP_RESET",
           "stream gap -> UNKNOWN")
 
