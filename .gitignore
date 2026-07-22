@@ -4,3 +4,4 @@ __pycache__/
 # recorded clips + manifest are data, not code (keep the dir, ignore contents)
 data/clips/*.json
 data/manifest.jsonl
+.harness/

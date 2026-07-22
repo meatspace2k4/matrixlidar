@@ -9,7 +9,7 @@ After `stream.orient()` a frame is indexed matrix[row][col] with row 0 = top,
 col 0 = column A.
 
 Named regions (operator-supplied geometry, small bathroom):
-  TOTO       = columns B,C x rows 7,8   (the toilet; bottom-left green block)
+  TOTO       = columns B,C,D x rows 7,8 (the toilet: a static 6-cell fixture)
   DOOR       = entire column H (the far-right range). Closed -> door panel
                ~1000-1160mm; open -> sensor sees into the hallway, ~1400 up to
                4000/no-target. Column G is the jamb/handle, NOT the door.
@@ -76,7 +76,10 @@ def _cells(cols, rows):
 ALL_ROWS = [1, 2, 3, 4, 5, 6, 7, 8]
 
 ZONE_CELLS = {
-    Zone.TOTO: _cells(["B", "C"], [7, 8]),
+    # static fixture: 6 cells, 3 wide starting at column B, bottom 2 rows.
+    # High enough resolution that the seat itself is measurable (future
+    # seat-up/down detection when unobscured).
+    Zone.TOTO: _cells(["B", "C", "D"], [7, 8]),
     Zone.DOOR: _cells(["H"], ALL_ROWS),
     Zone.FRAME: _cells(["A"], ALL_ROWS),
 }
