@@ -23,6 +23,21 @@ RETRY_DELAY = 1.0
 MAX_ATTEMPTS = 60  # ~ covers a full Pi reboot
 
 _cached_ip = None  # last good peer IP; skips slow .local mDNS on reconnects
+_sock = None       # the socket frames() is currently reading (for send())
+
+
+def send(line):
+    """Best-effort send of one line back to the server on the live stream
+    socket (the server understands MARK/DUMP). Never raises; drops the line
+    if not currently connected."""
+    s = _sock
+    if s is None:
+        return False
+    try:
+        s.sendall((line.rstrip("\n") + "\n").encode())
+        return True
+    except OSError:
+        return False
 
 
 def rotate_cw(m):
@@ -72,11 +87,13 @@ def frames(host=HOST, port=PORT, on_wait=None):
 
     Raises ConnectionError only if the Pi can't be reached after MAX_ATTEMPTS.
     """
+    global _sock
     while True:
         sock = connect_with_retry(host, port, on_wait)
         if sock is None:
             raise ConnectionError("could not reach %s:%d after %d attempts"
                                   % (host, port, MAX_ATTEMPTS))
+        _sock = sock
         try:
             with sock.makefile("r") as f:
                 for line in f:
@@ -94,6 +111,8 @@ def frames(host=HOST, port=PORT, on_wait=None):
             # makefile() wraps the socket but does NOT close it; close it here.
             # This is a generator, so on an early `break` the finally runs when
             # the generator is closed (GC or explicit .close()), releasing the fd.
+            if _sock is sock:
+                _sock = None
             try:
                 sock.close()
             except OSError:

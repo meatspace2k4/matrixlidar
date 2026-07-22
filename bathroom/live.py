@@ -14,7 +14,7 @@ import sys
 import time
 from collections import deque
 
-from . import config, detect, occupancy, stream, sparkline
+from . import archive, config, detect, occupancy, stream, sparkline
 from .engine import StateEngine
 from .zones import State
 
@@ -46,6 +46,7 @@ def main():
     baseline = config.load_baseline()
     eng = StateEngine(baseline=baseline, commit_after=args.commit_after)
     room_eng = occupancy.OccupancyEngine()
+    marker = archive.Marker()
     occ_hist = deque(maxlen=HIST)
     state_hist = deque(maxlen=HIST)
     col_hist = deque(maxlen=DRIFT_FRAMES)
@@ -56,6 +57,7 @@ def main():
             t0 = t0 if t0 is not None else now
             u = eng.update(m, now - t0)
             ru = room_eng.update(u, now - t0)
+            marker.update(u, ru, now - t0)
             occ_hist.append(u.features["occ_count"])
             state_hist.append(u.committed)
             cells = u.features["occ_cells"]

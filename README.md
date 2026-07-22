@@ -56,6 +56,12 @@ the occupant count. Boot and stream gaps are UNKNOWN, never assumed EMPTY.
 Events: `ENTRY_CONFIRMED`, `ENTRY_ABORTED`, `EXIT`, `GAP_RESET`. Design:
 `docs/occupancy-design.md`.
 
+Committed transitions are also reported back to the Pi (`bathroom/archive.py`
+sends `MARK` lines on the stream socket). The server snapshots its latest raw
+frame with each mark into an in-memory ring (255 transitions, RAM only,
+nothing on the SD card), grouped into sessions by the room state. `replay.py`
+fetches the archive (`DUMP`) and replays it by time.
+
 ## Use
 
 Run from the repo root (so `import bathroom` resolves). Stdlib only for
@@ -65,6 +71,8 @@ capture; `numpy` only for the training loader.
 python3 heatmap_client.py            # live heatmap (cm) + zone panel + STATE + ROOM + sparkline
 python3 -m bathroom.live             # text live readout: room, state, door%, sparkline, state strip
 python3 -m bathroom.engine <clip>    # static render of a recorded clip (timeline + sparkline)
+python3 replay.py                    # list archived transition sessions (from the Pi's RAM ring)
+python3 replay.py --session N        # replay one session's raw-frame snapshots by time
 ```
 
 ### Capture labeled clips
@@ -151,6 +159,7 @@ the engine and the frame classifier to score 1.0 on the labeled fixtures.
 
 ```
 heatmap_client.py        live heatmap (cm) + zone panel + STATE + ROOM + sparkline
+replay.py                fetch + replay the Pi's in-memory transition archive
 doorcal.py               live door-panel readout for calibrating column H
 baselines/empty.json     empty-room reference for the classifier
 docs/occupancy-design.md room occupancy engine design
@@ -161,6 +170,7 @@ bathroom/
   classify.py            per-frame classifier (baseline-relative)
   engine.py              temporal state machine (debounce, timeline) + CLI
   occupancy.py           room occupancy engine (UNKNOWN/EMPTY/OCCUPIED + events)
+  archive.py             forward committed transitions to the Pi's RAM archive
   sparkline.py           occupancy sparkline + colored state strip
   record.py              time-based labeled clip capture (CLI)
   live.py                live state readout (CLI)
