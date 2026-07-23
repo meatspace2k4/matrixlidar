@@ -57,7 +57,7 @@ def main():
             t0 = t0 if t0 is not None else now
             u = eng.update(m, now - t0)
             door = detect.door_open_pct(m)
-            ru = room_eng.update(u, now - t0, door_pct=door)
+            ru = room_eng.update(m, now - t0, door_pct=door)
             marker.update(u, ru, now - t0)
             occ_hist.append(u.features["occ_count"])
             state_hist.append(u.committed)
