@@ -75,7 +75,9 @@ def main():
     # 1. DEEP terminus: receded to door plane at door column, vanish with NO
     # door signal -> EXIT, EMPTY, occupants 0. Door is not consulted at all.
     e, t = _occupied_engine()
-    t, ev = drive(e, t, [(0.6, (4, 6), (700, 1050)),  # doorward ramp to depth 1050
+    # depth smoothing lags like column smoothing: the ramp must exceed the
+    # door plane enough that the TRAILING average clears DOOR_PLANE_MM
+    t, ev = drive(e, t, [(0.6, (4, 6), (900, 1200)),  # doorward ramp past door plane
                          (Params.T_ABSENT + 0.1, None, None)])  # vanish, no door
     check(e.room == RoomState.EMPTY and e.occupants == 0 and "EXIT" in ev,
           "DEEP terminus (door plane depth + door column) -> EXIT")
