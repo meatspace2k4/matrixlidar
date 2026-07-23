@@ -201,7 +201,11 @@ def read_frame(matrix, baseline=None):
             if v >= NO_TARGET:
                 no_target += 1
                 continue
-            if v > 0 and v < Params.BAND_LO * _eff_base(base[r][c]):
+            # a surviving return that is body-depth (the same criterion a
+            # body cell uses). On a blocked view these are the positive
+            # evidence that something is there: the real churn frames carry
+            # ~4 of them at 673-824mm while the rest of the field is dead.
+            if v > 0 and _eff_base(base[r][c]) - v >= Params.MARGIN_MM:
                 near.append((label(r, c), v))
             b = _eff_base(base[r][c])
             if b - v < Params.MARGIN_MM:
