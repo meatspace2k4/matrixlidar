@@ -155,16 +155,26 @@ def main():
     check(e.room == RoomState.EMPTY and "EXIT" in ev,
           "same trajectory receded to door plane IS an exit")
 
-    # DOOR MOTION: body vanishes mid-field (missed exit), then the door
-    # open% changes with nobody visible and holds -> EXIT after stillness
-    # (real failures: exit behind closing door / door left ajar).
+    # NEAR TERMINUS + DOOR CORROBORATION: track ends door-side at close
+    # depth (the 45-degree close-pass exit), then the door changes and holds
+    # -> EXIT (real failure: exit behind closing door, session_001).
     e, t = _occupied_engine()
-    t, ev = drive(e, t, [(0.5, (3, 4), 500),          # drifts, still visible
-                         (1.0, None, None, 0.0),      # vanish mid; door 0%
-                         (0.5, None, None, 60.0),     # door moved to 60% ajar
+    t, ev = drive(e, t, [(0.6, (4, 6), 500),          # doorward, close pass
+                         (1.0, None, None, 0.0),      # vanish at door; 0%
+                         (0.5, None, None, 60.0),     # door operated
                          (2.5, None, None, 60.0)])    # stillness
     check(e.room == RoomState.EMPTY and "EXIT" in ev,
-          "door moved while empty + stillness -> EXIT (door-motion rule)")
+          "near door terminus + door corroboration -> EXIT")
+
+    # HALLWAY PROTECTION: occupant vanished OFF-side (shower); a door change
+    # afterward (hallway-side operation / noise) must NOT empty the room.
+    e, t = _occupied_engine()
+    t, ev = drive(e, t, [(0.5, (3, 0), 700),          # vanish left
+                         (1.0, None, None, 30.0),
+                         (0.5, None, None, 90.0),     # door operated outside
+                         (3.0, None, None, 90.0)])
+    check(e.room == RoomState.OCCUPIED and "EXIT" not in ev,
+          "door change after off-side vanish is ignored (hallway-side)")
 
     # DOOR MOTION guard: shower vanish with the door NEVER moving stays
     # OCCUPIED indefinitely (no timeout exit).

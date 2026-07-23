@@ -5,13 +5,15 @@ touches sensing, orientation, zones, or the posture classifier.
 Rules (operator semantics):
 - The door is the only exit. A body vanishing off the left FOV edge
   (sink/tub/shower) or mid-field stays OCCUPIED.
-- Exits are deltas: bodies leaving cannot be counted, so ANY door-side vanish
-  marks the room EMPTY, from any state. Door-side is judged in BOTH column
-  and depth (this is a ToF depth map; a body near the lens smears across
-  columns and can reach the door column at 400mm, which is not an exit).
-- The door does not move on its own: a door open% change while nobody is
-  visible, followed by stillness, is an exit that was missed visually
-  (exit behind a closing door, or a door left ajar).
+- Exits derive from the BODY TRACK's terminus, judged in column AND depth
+  (this is a ToF depth map). A terminus in the door band at door-plane depth
+  is an exit outright. A terminus in the door band at close depth (at the
+  45-degree mount an exit passes close by the lens) is an exit only when the
+  door is then operated and stays changed: track first, door corroborates.
+- The door alone can never change room state: it is operated from both
+  sides, it is obscured by whoever operates it, and its column is noisy. A
+  door change after an off-side vanish (shower, mid-field occlusion,
+  artifact) is ignored.
 - Entries are observable: a door-side appear that penetrates into the field
   while already OCCUPIED increments the occupant count.
 - Boot and stream gaps are UNKNOWN, never EMPTY; only an observed exit (or a
@@ -120,26 +122,35 @@ class OccupancyEngine:
         self._counted = False
         self._absent_since = None
 
-    def _vanish_door_side(self):
-        """Door-side vanish: trailing centroid at the door band (or one column
-        short while drifting doorward), AND depth consistent with the door
-        plane. A body near the lens smears across columns and can reach the
-        door column at 400-500mm; a real exit has receded to ~the door plane
-        (>= DOOR_PLANE_MM) by the time it vanishes."""
+    def _vanish_terminus(self):
+        """Classify where the track TERMINATED. The body is the primary
+        object; the door is never consulted here.
+
+          "deep"  trailing centroid in the door band, receded to the door
+                  plane (>= DOOR_PLANE_MM): an unambiguous walk-out.
+          "near"  trailing centroid in the door band at close depth: at the
+                  45-degree mount an exit passes close by the lens at the
+                  door column, indistinguishable by track alone from a close
+                  pass that stays inside. Needs corroboration.
+          "off"   anywhere else: not an exit terminus, and no later door
+                  signal may reinterpret it (doors are operated from both
+                  sides; a hallway-side operation says nothing about a body
+                  that vanished mid-field or left).
+        """
         if not self._track:
-            return False
+            return "off"
         tail = self._track[-Params.L:]
         end = sum(p[1] for p in tail) / len(tail)
         drift = tail[-1][1] - tail[0][1]
         col_ok = (end >= Params.DOOR_COL
                   or (end >= Params.DOOR_COL - 1.0 and drift >= Params.D_DRIFT))
         if not col_ok:
-            return False
+            return "off"
         depths = [p[2] for p in tail if p[2] is not None]
         if not depths:
-            return True  # no depth info: legacy column-only behavior
+            return "deep"  # no depth info: legacy column-only behavior
         end_mm = sum(depths) / len(depths)
-        return end_mm >= Params.DOOR_PLANE_MM
+        return "deep" if end_mm >= Params.DOOR_PLANE_MM else "near"
 
     # ---- one step --------------------------------------------------------
 
@@ -211,24 +222,32 @@ class OccupancyEngine:
                     self._absent_since = t
                 elif t - self._absent_since >= Params.T_ABSENT:
                     # the run is over: a vanish
-                    door_side = self._vanish_door_side()
+                    terminus = self._vanish_terminus()
                     run_len = self._absent_since - self._run_start
                     self._end_run()
-                    if door_side:
+                    if terminus == "deep":
                         # ANY observed exit empties the room (delta-only rule)
                         self._maybe = False
                         self._set_room(RoomState.EMPTY, 0, t)
                         event = "EXIT"
+                    elif terminus == "near":
+                        # door-side close-pass terminus: an exit iff the door
+                        # is then operated; remember the door state at the
+                        # vanish for that corroboration
+                        if door_pct is not None:
+                            self._vanish_pct = door_pct
+                        if self._maybe:
+                            self._run_presence += run_len
+                            self._abort_at = t + Params.T_DECAY
                     else:
+                        # off-side terminus: never an exit candidate; door
+                        # signals must not reinterpret it (hallway-side
+                        # operation, noise, obscured column)
+                        self._vanish_pct = None
                         if self._maybe:
                             # unconfirmed body gone off-side: arm the anti-latch
                             self._run_presence += run_len
                             self._abort_at = t + Params.T_DECAY
-                        # off-side vanish while occupied: remember the door
-                        # state so a later door movement (with nobody visible)
-                        # can be read as the exit we missed
-                        if door_pct is not None:
-                            self._vanish_pct = door_pct
             if (self._abort_at is not None and t >= self._abort_at
                     and self._maybe):
                 self._maybe = False
@@ -237,13 +256,13 @@ class OccupancyEngine:
                 # EMPTY out of an UNKNOWN boot
                 self._set_room(self._prior, 0, t)
                 event = "ENTRY_ABORTED"
-            # door-motion exit: the door does not move on its own. If the
-            # field is empty, we are OCCUPIED, and the door open% has changed
-            # since the body vanished and stayed changed, whoever moved it
-            # left through it. After T_DOOR_STILL of continued emptiness,
-            # that is the exit (covers exit-behind-a-closing-door and the
-            # door-left-ajar case). A body out of FOV left (shower) never
-            # trips this: the door state does not change.
+            # door corroboration for a NEAR terminus only (_vanish_pct is set
+            # exclusively by a door-side close-pass vanish): the track said
+            # the body ended at the door; the door then being operated and
+            # staying changed, with stillness, completes the exit. Off-side
+            # vanishes never set _vanish_pct, so a hallway-side door
+            # operation or a noisy/obscured door column can never empty the
+            # room on its own.
             if (event is None and self.room == RoomState.OCCUPIED
                     and door_pct is not None and self._vanish_pct is not None):
                 if self._door_moved_at is None:
