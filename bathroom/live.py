@@ -86,6 +86,8 @@ def main():
                 shown += _direction(col_hist)   # '<-' left / '->' right
             room_txt = "%s(%d) %s" % (ru.room, ru.occupants,
                                       occupancy.fmt_duration((now - t0) - ru.since))
+            if ru.event == "OCCLUDED":
+                shown = "VIEW BLOCKED"
             lead = "%-20s %-21s inst=%-18s door=%3.0f%% " % (
                 room_txt, shown, u.instant.name, door)
             # fit the line to the terminal: a wrapped line cannot be

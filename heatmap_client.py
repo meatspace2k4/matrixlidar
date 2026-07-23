@@ -131,7 +131,9 @@ def main():
             else:
                 col_hist.clear()
             shown = u.committed.name
-            if u.committed == State.WALKING:
+            if ru.event == "OCCLUDED":
+                shown = "VIEW BLOCKED"
+            elif u.committed == State.WALKING:
                 shown += _direction(col_hist)   # '<-' left / '->' right
             room_txt = "%s(%d) %s" % (ru.room, ru.occupants,
                                       occupancy.fmt_duration((now - t0) - ru.since))

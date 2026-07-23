@@ -39,7 +39,7 @@ class RoomUpdate:
         self.room = room            # externally reported RoomState.*
         self.occupants = occupants  # 0 unless OCCUPIED
         self.event = event          # ENTRY_CONFIRMED/EXIT/PRESENCE_NO_ENTRY/
-                                    # GAP_RESET/None
+                                    # OCCLUDED/GAP_RESET/None
         self.since = since          # t when the reported room state last changed
 
 
@@ -89,6 +89,9 @@ class OccupancyEngine:
             elif ev["kind"] == "PRESENCE_NO_ENTRY" and event is None:
                 # surfaced, never latched
                 event = "PRESENCE_NO_ENTRY"
+            elif ev["kind"] == "OCCLUDED" and event is None:
+                # the view is blocked; room state is deliberately unchanged
+                event = "OCCLUDED"
         return RoomUpdate(self.room, self.occupants, event, self.since)
 
 

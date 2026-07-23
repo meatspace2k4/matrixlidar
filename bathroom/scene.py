@@ -109,6 +109,16 @@ class Params:
     MIN_INTERIOR_CELLS = 7   # above the 6-cell worst-case baseline drift,
                              # below the 9-cell minimum attested body
     DEBOUNCE_N = 2           # consecutive contrary readings to flip a bool
+    # scene validity: the empty scene's walls and floor return on essentially
+    # every ray (the baseline itself carries exactly one no-target cell), so a
+    # frame reporting nothing almost everywhere is not an empty room, it is a
+    # blocked view. A body close to the lens does not read "close": it
+    # INVALIDATES rays and they come back no-target. Corpus separation is
+    # wide and unambiguous: normal frames carry 0-25 no-target cells (262
+    # historical frames across 11 sessions, plus a 148-frame live sample, all
+    # below 40), while the churn-window frames carry 40-59 with only 3-17
+    # survivors sitting at 673-824mm. 32 sits in that gap, at half the field.
+    MAX_NO_TARGET = 32       # more no-target cells than this => view blocked
     # door panel classification (informational only):
     PANEL_OPEN = 1.35        # H reading >= this * baseline -> hallway seen
     PANEL_CLOSED_HI = 1.12   # H median within [0.95, this] * baseline
@@ -157,10 +167,12 @@ class SceneReading:
     doorway cells carry (label, mm, band_lo, band_hi)."""
 
     __slots__ = ("interior_body", "interior_cells", "doorway_body",
-                 "doorway_cells", "subfloor_cells", "vetoed", "door_panel")
+                 "doorway_cells", "subfloor_cells", "vetoed", "door_panel",
+                 "occluded", "no_target_count", "near_returns")
 
     def __init__(self, interior_body, interior_cells, doorway_body,
-                 doorway_cells, subfloor_cells, vetoed, door_panel):
+                 doorway_cells, subfloor_cells, vetoed, door_panel,
+                 occluded=False, no_target_count=0, near_returns=()):
         self.interior_body = interior_body
         self.interior_cells = interior_cells
         self.doorway_body = doorway_body
@@ -168,6 +180,11 @@ class SceneReading:
         self.subfloor_cells = subfloor_cells
         self.vetoed = vetoed
         self.door_panel = door_panel
+        self.occluded = occluded            # the view is blocked: this frame
+                                            # is NOT evidence of an empty room
+        self.no_target_count = no_target_count
+        self.near_returns = near_returns    # surviving near-field cells: the
+                                            # positive evidence of a body
 
 
 def read_frame(matrix, baseline=None):
@@ -176,11 +193,20 @@ def read_frame(matrix, baseline=None):
     interior = []   # (label, mm) body cells, columns A-E
     in_band = []    # (label, mm, lo, hi) doorway-ray body cells in the band
     sub_floor = []  # (label, mm) doorway-ray body cells below the floor
+    no_target = 0   # rays returning nothing: the scene-validity signal
+    near = []       # (label, mm) surviving near-field returns
     for r in range(N):
         for c in range(N):
             v = matrix[r][c]
             if v >= NO_TARGET:
+                no_target += 1
                 continue
+            # a surviving return that is body-depth (the same criterion a
+            # body cell uses). On a blocked view these are the positive
+            # evidence that something is there: the real churn frames carry
+            # ~4 of them at 673-824mm while the rest of the field is dead.
+            if v > 0 and _eff_base(base[r][c]) - v >= Params.MARGIN_MM:
+                near.append((label(r, c), v))
             b = _eff_base(base[r][c])
             if b - v < Params.MARGIN_MM:
                 continue
@@ -200,9 +226,14 @@ def read_frame(matrix, baseline=None):
     # sub-floor doorway-ray returns are a body inside the room
     interior_evidence = interior + sub_floor
     interior_body = len(interior_evidence) >= Params.MIN_INTERIOR_CELLS
+    # the walls do not disappear: this many dead rays means the view is
+    # blocked, so the frame says nothing about whether the room is empty
+    occluded = no_target > Params.MAX_NO_TARGET
     return SceneReading(interior_body, interior_evidence, doorway_body,
                         in_band, sub_floor, vetoed,
-                        door_panel_state(matrix, base))
+                        door_panel_state(matrix, base),
+                        occluded=occluded, no_target_count=no_target,
+                        near_returns=near)
 
 
 class _Debounced:
@@ -245,10 +276,30 @@ class SceneAutomaton:
         self.occupied = False
         self.first_interior_t = None
         self.first_doorway_t = None
+        self._occluded_run = 0   # consecutive blocked frames
+        self._occluded_reported = False
 
     def step(self, t, reading, fresh=False):
         """Feed one reading; returns a list of event dicts."""
         events = []
+
+        if reading.occluded:
+            # The view is blocked: absence of returns is not absence of a
+            # body, so this frame is NOT evidence. Hold every debounced
+            # value, feed no edges, and never resolve a pending transit off
+            # it (that is what manufactured the EXIT/PRESENCE churn).
+            self._occluded_run += 1
+            if (self._occluded_run > Params.DEBOUNCE_N
+                    and not self._occluded_reported):
+                self._occluded_reported = True
+                events.append({"t": t, "kind": "OCCLUDED",
+                               "no_target": reading.no_target_count,
+                               "near": list(reading.near_returns),
+                               "panel": reading.door_panel})
+            return events
+        self._occluded_run = 0
+        self._occluded_reported = False
+
         if fresh:
             door_rose, _ = self.door.reset(reading.doorway_body)
             int_rose, _ = self.interior.reset(reading.interior_body)
