@@ -10,6 +10,7 @@ WALKING), door%, the occupancy sparkline, and the recent state strip. On exit
 it prints the session timeline.
 """
 import argparse
+import shutil
 import sys
 import time
 from collections import deque
@@ -80,15 +81,29 @@ def main():
                                      % (f["occ_count"], f["vnear_count"], f["upper_count"],
                                         f["lower_count"], int(f["toto_occluded"]), f["min_mm"]))
 
-            spark = sparkline.sparkline(occ_hist, lo=0, hi=max(8, max(occ_hist)))
-            strip = sparkline.state_strip(state_hist)
             shown = u.committed.name
             if u.committed == State.WALKING:
                 shown += _direction(col_hist)   # '<-' left / '->' right
             room_txt = "%s(%d) %s" % (ru.room, ru.occupants,
                                       occupancy.fmt_duration((now - t0) - ru.since))
-            sys.stdout.write("\r\x1b[K%-20s %-21s inst=%-18s door=%3.0f%% |%s| %s"
-                             % (room_txt, shown, u.instant.name, door, spark, strip))
+            lead = "%-20s %-21s inst=%-18s door=%3.0f%% " % (
+                room_txt, shown, u.instant.name, door)
+            # fit the line to the terminal: a wrapped line cannot be
+            # rewritten with \r and scrolls a new row per frame instead
+            cols = shutil.get_terminal_size(fallback=(120, 24)).columns
+            if len(lead) > cols - 1:
+                lead = lead[:max(0, cols - 1)]  # plain text, safe to slice
+            avail = cols - len(lead) - 1
+            spark = strip = ""
+            if avail >= 12:
+                spark_w = min(HIST, max(8, (avail - 3) // 2))
+                strip_w = min(HIST, avail - spark_w - 3)
+                spark = "|%s|" % sparkline.sparkline(
+                    list(occ_hist)[-spark_w:], lo=0, hi=max(8, max(occ_hist)))
+                if strip_w >= 8:
+                    spark += " " + sparkline.state_strip(
+                        list(state_hist)[-strip_w:])
+            sys.stdout.write("\r\x1b[K%s%s" % (lead, spark))
             sys.stdout.flush()
     except (KeyboardInterrupt, ConnectionError) as e:
         eng.close()
