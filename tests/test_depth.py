@@ -22,12 +22,14 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, HERE)
 
 import test_classify as tc                                   # noqa: E402
-from bathroom import config, stream                          # noqa: E402
-from bathroom.classify import classify                       # noqa: E402
+from bathroom import stream                                  # noqa: E402
+from bathroom.classify import classify, DEFAULT_BASELINE     # noqa: E402
 from bathroom.scene import read_frame                        # noqa: E402
 from bathroom.zones import N, State                          # noqa: E402
 
-BASELINE = config.load_baseline()
+# these are HISTORICAL captures: score them against the frozen scene they
+# were taken in, not today's live baseline (the room has drifted since)
+BASELINE = DEFAULT_BASELINE
 FIXDIR = os.path.join(ROOT, "fixtures", "misdetections")
 
 FAILS = []
