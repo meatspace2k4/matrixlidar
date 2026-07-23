@@ -70,8 +70,9 @@ def main():
     ap.add_argument("--hz", type=float, default=10.0)
     ap.add_argument("--bridge", action="store_true",
                     help="repeat each snapshot's frame at --hz until the next "
-                         "snapshot (use only when the live record attests "
-                         "continuous evidence between them)")
+                         "snapshot, but only across gaps <= 1.0s (longer "
+                         "stretches are unobserved and must not be fabricated; "
+                         "the engine's own gap handling covers them)")
     a = ap.parse_args()
 
     classify_m, occupancy_m, stream_m, detect_m, baseline = load_stack(a.code_root)
@@ -85,18 +86,15 @@ def main():
     def to_update(frame_csv):
         flat = [int(x) for x in frame_csv.split(",")]
         mat = stream_m.orient([flat[i * 8:(i + 1) * 8] for i in range(8)])
-        st, feats = classify_m.classify(mat, baseline)
-        # feed door% exactly as the live clients do; without it the engine's
-        # door-motion exit rule is structurally disabled in replay
-        return Shim(st, feats), detect_m.door_open_pct(mat)
+        return mat, detect_m.door_open_pct(mat)
 
     eng = occupancy_m.OccupancyEngine()
     t0 = trs[0]["ts"]
     events = []
 
     def step(pair, t):
-        u, door_pct = pair
-        ru = eng.update(u, t, door_pct=door_pct)
+        mat, door_pct = pair
+        ru = eng.update(mat, t, door_pct=door_pct)
         if ru.event:
             events.append((t, ru.event, ru.room))
 
@@ -107,10 +105,11 @@ def main():
             step(to_update(tr["frame"]), t_here)
             if i + 1 < len(trs):
                 t_next = trs[i + 1]["ts"] - t0
-                t_b = t_here
-                while t_b + 1.0 / a.hz < t_next:
-                    t_b += 1.0 / a.hz
-                    step(to_update(tr["frame"]), t_b)
+                if t_next - t_here <= 1.0:  # only attestable continuity
+                    t_b = t_here
+                    while t_b + 1.0 / a.hz < t_next:
+                        t_b += 1.0 / a.hz
+                        step(to_update(tr["frame"]), t_b)
     else:
         for tr in trs:
             step(to_update(tr["frame"]), tr["ts"] - t0)
