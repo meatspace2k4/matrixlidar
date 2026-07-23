@@ -45,18 +45,18 @@ class FramePredictor:
         self.baseline = baseline
         self.window = window
 
-    def per_frame(self, frames):
+    def per_frame(self, frames, baseline=None):
         from collections import deque
         win = deque(maxlen=self.window)
         out = []
         for m in frames:
             win.append(m)
-            st, _ = classify_window(list(win), self.baseline)
+            st, _ = classify_window(list(win), baseline or self.baseline)
             out.append(st)
         return out
 
-    def predict(self, frames):
-        return _dominant(self.per_frame(frames))
+    def predict(self, frames, baseline=None):
+        return _dominant(self.per_frame(frames, baseline))
 
 
 class EnginePredictor:
@@ -68,8 +68,8 @@ class EnginePredictor:
         self.window = window
         self.commit_after = commit_after
 
-    def per_frame(self, frames):
-        eng = StateEngine(baseline=self.baseline, window=self.window,
+    def per_frame(self, frames, baseline=None):
+        eng = StateEngine(baseline=baseline or self.baseline, window=self.window,
                           commit_after=self.commit_after)
         out = []
         for i, m in enumerate(frames):
@@ -77,8 +77,8 @@ class EnginePredictor:
         eng.close()
         return out
 
-    def predict(self, frames):
-        eng = StateEngine(baseline=self.baseline, window=self.window,
+    def predict(self, frames, baseline=None):
+        eng = StateEngine(baseline=baseline or self.baseline, window=self.window,
                           commit_after=self.commit_after)
         for i, m in enumerate(frames):
             eng.update(m, i / 15.0)
@@ -121,10 +121,13 @@ def run(predictor, samples, frame_level=False):
             clip_pairs.append((truth, pred))
             rows.append((s.id, s.label, pred, "ok" if pred == truth else "MISS"))
             continue
-        pred = predictor.predict(s.frames).name
+        # score every sample against the baseline it was captured against,
+        # never today's live scene (the room drifts; that drift would read as
+        # depression in cells the body never touched)
+        pred = predictor.predict(s.frames, s.baseline).name
         clip_pairs.append((truth, pred))
         if frame_level and hasattr(predictor, "per_frame"):
-            for st in predictor.per_frame(s.frames):
+            for st in predictor.per_frame(s.frames, s.baseline):
                 frame_pairs.append((truth, st.name))
         rows.append((s.id, s.label, pred, "ok" if pred == truth else "MISS"))
     return clip_pairs, frame_pairs, rows
