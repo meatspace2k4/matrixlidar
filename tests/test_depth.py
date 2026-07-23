@@ -24,7 +24,7 @@ sys.path.insert(0, HERE)
 import test_classify as tc                                   # noqa: E402
 from bathroom import config, stream                          # noqa: E402
 from bathroom.classify import classify                       # noqa: E402
-from bathroom.occupancy import Params as OccParams           # noqa: E402
+from bathroom.scene import read_frame                        # noqa: E402
 from bathroom.zones import N, State                          # noqa: E402
 
 BASELINE = config.load_baseline()
@@ -84,11 +84,13 @@ def main():
             if tr["mark"]["kind"] == "posture" and tr["mark"]["to"] == "WALKING"]
     check(len(tail) >= 1, "fixture holds the false-exit crossing frame")
     for tr in tail:
-        st, f = classify(oriented(tr["frame"]), BASELINE)
-        check(f["body_mm"] is not None
-              and f["body_mm"] < OccParams.DOOR_PLANE_MM,
-              "crossing frame body_mm=%s is inside the door plane (<%d)"
-              % (f["body_mm"], OccParams.DOOR_PLANE_MM))
+        mat = oriented(tr["frame"])
+        st, f = classify(mat, BASELINE)
+        reading = read_frame(mat, BASELINE)
+        check(not reading.doorway_body,
+              "crossing frame is not a doorway transit (body_mm=%s, "
+              "vetoed=%s, sub_floor=%d)"
+              % (f["body_mm"], reading.vetoed, len(reading.subfloor_cells)))
 
     # depth features sanity on the seeds: seated body reads at seat depth,
     # the standing seed does not satisfy the seat condition
