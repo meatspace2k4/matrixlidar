@@ -245,10 +245,3 @@ def classify(matrix, baseline=None):
             and f["body_at_seat"]):
         return State.SITTING_AT_TOILET, f
     return State.UNKNOWN, f
-
-
-def classify_window(frames, baseline=None):
-    """Denoise a window of frames, then classify. `frames` must be non-empty."""
-    if not frames:
-        raise ValueError("classify_window requires at least one frame")
-    return classify(median_window(frames), baseline)

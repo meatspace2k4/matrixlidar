@@ -21,7 +21,7 @@ import json
 import sys
 
 from . import config, ingest, metrics
-from .classify import classify_window
+from .classify import classify
 from .engine import StateEngine
 from .zones import State, from_label
 
@@ -38,22 +38,16 @@ def _dominant(states):
 
 
 class FramePredictor:
-    """Per-frame classifier; clip label = dominant per-frame state."""
+    """Per-frame classifier; clip label = dominant per-frame state. Each
+    frame is classified independently, no cross-frame averaging."""
     name = "frame"
 
-    def __init__(self, baseline, window=5):
+    def __init__(self, baseline):
         self.baseline = baseline
-        self.window = window
 
     def per_frame(self, frames, baseline=None):
-        from collections import deque
-        win = deque(maxlen=self.window)
-        out = []
-        for m in frames:
-            win.append(m)
-            st, _ = classify_window(list(win), baseline or self.baseline)
-            out.append(st)
-        return out
+        base = baseline or self.baseline
+        return [classify(m, base)[0] for m in frames]
 
     def predict(self, frames, baseline=None):
         return _dominant(self.per_frame(frames, baseline))
@@ -63,13 +57,12 @@ class EnginePredictor:
     """Debounced temporal engine; clip label = dominant committed state."""
     name = "engine"
 
-    def __init__(self, baseline, window=5, commit_after=4):
+    def __init__(self, baseline, commit_after=4):
         self.baseline = baseline
-        self.window = window
         self.commit_after = commit_after
 
     def per_frame(self, frames, baseline=None):
-        eng = StateEngine(baseline=baseline or self.baseline, window=self.window,
+        eng = StateEngine(baseline=baseline or self.baseline,
                           commit_after=self.commit_after)
         out = []
         for i, m in enumerate(frames):
@@ -78,7 +71,7 @@ class EnginePredictor:
         return out
 
     def predict(self, frames, baseline=None):
-        eng = StateEngine(baseline=baseline or self.baseline, window=self.window,
+        eng = StateEngine(baseline=baseline or self.baseline,
                           commit_after=self.commit_after)
         for i, m in enumerate(frames):
             eng.update(m, i / 15.0)

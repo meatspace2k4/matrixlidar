@@ -28,7 +28,6 @@ from .engine import StateEngine
 from .zones import N, ORIENTATION
 
 SCHEMA = "bathroom-clip/1"
-WINDOW = 5  # trailing frames the per-frame auto state is denoised over
 BASELINE_SECONDS = 6
 
 
@@ -95,7 +94,7 @@ def _waiting(attempt, total):
 def record_clip(label, seconds, notes=None):
     config.ensure_dirs()
     baseline = config.load_baseline()
-    eng = StateEngine(baseline=baseline, window=WINDOW)
+    eng = StateEngine(baseline=baseline)
     frames = []
 
     def on_frame(m, t):
