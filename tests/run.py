@@ -16,7 +16,7 @@ ROOT = os.path.dirname(HERE)
 
 SCRIPTS = ["test_classify.py", "test_classify_adversarial.py", "test_pipeline.py",
            "test_depth.py", "test_scene_engine.py", "test_replay_sessions.py",
-           "test_occlusion.py"]
+           "test_occlusion.py", "test_seated.py"]
 GATES = [
     ["python3", "-m", "bathroom.validate", "--predictor", "engine", "--no-clips", "--min-accuracy", "1.0"],
     ["python3", "-m", "bathroom.validate", "--predictor", "frame", "--no-clips", "--min-accuracy", "1.0"],

@@ -64,7 +64,16 @@ class Params:
                             # deep head cell before it counts as STANDING; a
                             # seated head leaned near the lens has none
     # depth (the frame is a ToF depth map, not a flat grid):
-    HEAD_ROWS = (0, 1, 2)   # upper region for the body-relative headroom test
+    HEAD_ROWS = (0,)        # the HEADROOM row only. It used to span rows 0-2,
+                            # but rows 1-2 are exactly where a SEATED torso and
+                            # head sit: 30 operator-attested sitting frames put
+                            # their topmost body-depth cell at row 2, so those
+                            # rows made upper_body oscillate 1-3 against a
+                            # threshold of 2 and the posture flapped
+                            # SITTING<->STANDING 26 times in four minutes.
+                            # Row 0 separates with no overlap: 0 cells in all
+                            # 32 sitting frames (30 attested + the seed), 3 in
+                            # the standing seed, 5 in walking.
     BODY_DEPTH_TOL = 250    # a cell within this of the body's median depth is
                             # part of the same body plane. Upper-region cells at
                             # BODY depth = the body reaches the top of the FOV
