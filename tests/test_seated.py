@@ -66,8 +66,12 @@ def main():
         if dt.hour == 18 and min_minute <= dt.minute <= max_minute:
             mark = tr.get("mark", {})
             to_state = mark.get("to", "")
-            # Collect transitions marked as SITTING_AT_TOILET (operator-attested)
-            if to_state == "SITTING_AT_TOILET":
+            # Every toilet-posture transition in this window is the operator
+            # SITTING (attested). Both destinations count: the old engine's
+            # label is exactly what is under test, so filtering to its
+            # SITTING verdicts would only sample the frames it happened to
+            # get right and hide the false STANDING commits.
+            if mark.get("kind") == "posture" and "TOILET" in to_state:
                 window_transitions.append(tr)
 
     # Assertion 1: At least 25 frames in the attested sitting window
