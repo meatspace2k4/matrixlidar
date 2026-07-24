@@ -14,7 +14,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bathroom import dataset, config                       # noqa: E402
-from bathroom.classify import classify_window, DEFAULT_BASELINE  # noqa: E402
+from bathroom.classify import median_window, DEFAULT_BASELINE  # noqa: E402
 from bathroom.zones import N, NO_TARGET, ORIENTATION, from_label, State  # noqa: E402
 
 FAILS = []
@@ -94,10 +94,10 @@ def main():
 
     # empty-window guard
     try:
-        classify_window([])
-        check(False, "classify_window([]) should raise")
+        median_window([])
+        check(False, "median_window([]) should raise")
     except ValueError:
-        check(True, "classify_window([]) raises ValueError")
+        check(True, "median_window([]) raises ValueError")
 
     # State.EMPTY (value 0) must round-trip through from_label without truthiness bugs
     check(from_label("empty") is State.EMPTY, "from_label('empty') -> EMPTY")
