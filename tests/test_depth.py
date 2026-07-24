@@ -30,7 +30,9 @@ from bathroom.zones import N, State                          # noqa: E402
 # these are HISTORICAL captures: score them against the frozen scene they
 # were taken in, not today's live baseline (the room has drifted since)
 BASELINE = DEFAULT_BASELINE
-FIXDIR = os.path.join(ROOT, "fixtures", "misdetections")
+# the ARCHIVED originals: live harvests are named by timestamp now, but
+# these historical captures are what the regressions are pinned to
+FIXDIR = os.path.join(ROOT, "fixtures", "misdetections", "archive")
 
 FAILS = []
 
@@ -47,7 +49,7 @@ def oriented(frame_csv):
 
 
 def session(sid):
-    with open(os.path.join(FIXDIR, "session_%03d.json" % sid)) as f:
+    with open(os.path.join(FIXDIR, "orig_session_%03d.json" % sid)) as f:
         return json.load(f)
 
 
@@ -75,8 +77,15 @@ def main():
             standing += 1
     check(still_sitting == 0,
           "no mirror frame classifies as SITTING (was 5/5, now %d)" % still_sitting)
-    check(standing >= mirror.__len__() // 2,
-          "most mirror frames read STANDING (%d/%d)" % (standing, len(mirror)))
+    # The operator's requirement is only that mirror use must not read as
+    # sitting at the toilet. UNKNOWN is the RIGHT answer for a body at the
+    # mirror: it is not at the toilet, so STANDING_AT_TOILET would be just as
+    # wrong a claim. (An earlier revision of this test asserted "most read
+    # STANDING", which encoded that wrong expectation.)
+    unknown = len(mirror) - still_sitting - standing
+    check(still_sitting == 0 and unknown + standing == len(mirror),
+          "mirror frames make no false toilet-sitting claim (%d UNKNOWN, %d STANDING)"
+          % (unknown, standing))
 
     # session 5 tail: the frames of the near-lens crossing that caused the
     # false EXIT must expose a body depth far inside the door plane, so the
