@@ -70,6 +70,18 @@ def load_baseline(path=None):
     return m
 
 
+def load_noise_floor(path=None):
+    """The nearest each cell was ever observed to read in an EMPTY room, or None.
+
+    Measured, not chosen. A flat depression cut sits inside the room's own spread
+    on 42 of the 64 cells, which is how an empty bathroom built a body-sized
+    shape and committed STANDING_AT_TOILET. Returns None per cell where the scan
+    has no observation, and the caller falls back to the flat cut there.
+    """
+    doc = baseline_meta(path)
+    return doc.get("noise_floor")
+
+
 def baseline_meta(path=None):
     """Return the baseline file's metadata dict (captured ts, etc.) or {}."""
     path = path or BASELINE_FILE

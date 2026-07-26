@@ -136,7 +136,37 @@ def seat_advance(matrix, baseline):
     return n
 
 
-def features(matrix, baseline):
+def present_cells(matrix, baseline, floor):
+    """Cells that have come nearer than the empty room EVER did, plus dead rays.
+
+    This answers "is anything there", which is a different question from "what
+    shape is it" and needs a different cut. NEAR_MM is a flat 250mm and the empty
+    room's own spread exceeds that on 42 of 64 cells, so presence measured with
+    it fires on nothing: 40 consecutive frames of an empty bathroom committed
+    STANDING_AT_TOILET. The floor is per cell and measured, so it cannot.
+    """
+    n = 0
+    for r in range(N):
+        for c in range(N):
+            if c == DOOR_COL:
+                continue
+            b = baseline[r][c]
+            if b >= NO_TARGET:
+                continue
+            v = matrix[r][c]
+            if v >= NO_TARGET:
+                n += 1
+                continue
+            f = floor[r][c] if floor else None
+            if f is None:
+                if b - v >= NEAR_MM:
+                    n += 1
+            elif v < f:
+                n += 1
+    return n
+
+
+def features(matrix, baseline, floor=None):
     """What the shape is and where it sits. Plain dict, logged next to the state."""
     near, gone = cells(matrix, baseline)
     shape = largest_shape(set(near) | gone)
@@ -148,6 +178,7 @@ def features(matrix, baseline):
                if c != DOOR_COL and matrix[r][c] >= NO_TARGET
                and baseline[r][c] < NO_TARGET)
     return {
+        "present": present_cells(matrix, baseline, floor),
         "blocked": bool(answerable) and dead > BLOCKED_FRACTION * answerable,
         "dead_rays": dead,
         "seat_mm": seat_mm(baseline),
@@ -177,9 +208,26 @@ def preflight(baseline):
                    if c != DOOR_COL and baseline[r][c] < NO_TARGET)))
 
 
+_FLOOR_CACHE = {}
+
+
+def _floor_for(baseline):
+    """The measured noise floor that goes with this scan, or None."""
+    key = id(baseline)
+    if key not in _FLOOR_CACHE:
+        try:
+            from . import config
+            fl = config.load_noise_floor()
+            live = config.load_baseline()
+            _FLOOR_CACHE[key] = fl if live == baseline else None
+        except Exception:
+            _FLOOR_CACHE[key] = None
+    return _FLOOR_CACHE[key]
+
+
 def classify(matrix, baseline):
     """One oriented frame -> (State, features)."""
-    f = features(matrix, baseline)
+    f = features(matrix, baseline, floor=_floor_for(baseline))
 
     if f["blocked"]:
         # Something is over the sensor. The empty room answers on essentially
@@ -188,7 +236,10 @@ def classify(matrix, baseline):
         # nothing can be seen. This is the one place UNKNOWN means something.
         return State.UNKNOWN, f
 
-    if f["body_cells"] < BODY_MIN:
+    # PRESENCE against the measured floor, not the flat cut. The shape below is
+    # still measured with NEAR_MM, because the two questions are different: one
+    # asks whether anything is there, the other asks what shape it is.
+    if f["present"] < BODY_MIN:
         return State.EMPTY, f
 
     if not f["touches_top"]:
