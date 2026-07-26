@@ -176,16 +176,6 @@ class OccupancyEngine:
             return RoomUpdate(self.room, self.occupants, event, self.since)
         self._blocked_run = 0
         self._blocked_said = False
-        # when the last outward crossing happened. A body walking OUT through
-        # the plane is still a body in the field on those same frames, so
-        # PRESENCE re-latched OCCUPIED one frame after the EXIT and the room
-        # said occupied with the bathroom empty. Observed live at 13:38:12:
-        #   room -> EMPTY     (EXIT)
-        #   room -> OCCUPIED  (PRESENCE)
-        # After a crossing out, presence has to see the field go clear before it
-        # may latch again.
-        self._exited_at = None
-        self._clear_since_exit = False
 
         crossed = self._crossing.update(matrix, self._scene, t)
         if crossed == threshold.EXIT:
