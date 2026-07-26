@@ -112,6 +112,16 @@ class OccupancyEngine:
         self._posture = StateEngine(baseline=baseline)
         self._blocked_run = 0
         self._blocked_said = False
+        # when the last outward crossing happened. A body walking OUT through
+        # the plane is still a body in the field on those same frames, so
+        # PRESENCE re-latched OCCUPIED one frame after the EXIT and the room
+        # said occupied with the bathroom empty. Observed live at 13:38:12:
+        #   room -> EMPTY     (EXIT)
+        #   room -> OCCUPIED  (PRESENCE)
+        # After a crossing out, presence has to see the field go clear before it
+        # may latch again.
+        self._exited_at = None
+        self._clear_since_exit = False
         # how many rays the SCAN itself answered. A ray it could not answer
         # (the whole door column, with the door open when the scan was taken)
         # says nothing about the view being blocked either, so the blocked test
@@ -166,11 +176,23 @@ class OccupancyEngine:
             return RoomUpdate(self.room, self.occupants, event, self.since)
         self._blocked_run = 0
         self._blocked_said = False
+        # when the last outward crossing happened. A body walking OUT through
+        # the plane is still a body in the field on those same frames, so
+        # PRESENCE re-latched OCCUPIED one frame after the EXIT and the room
+        # said occupied with the bathroom empty. Observed live at 13:38:12:
+        #   room -> EMPTY     (EXIT)
+        #   room -> OCCUPIED  (PRESENCE)
+        # After a crossing out, presence has to see the field go clear before it
+        # may latch again.
+        self._exited_at = None
+        self._clear_since_exit = False
 
         crossed = self._crossing.update(matrix, self._scene, t)
         if crossed == threshold.EXIT:
             # exits are deltas and cannot be attributed, so the count zeroes
             self._set_room(RoomState.EMPTY, 0, t)
+            self._exited_at = t
+            self._clear_since_exit = False
             return RoomUpdate(self.room, self.occupants, "EXIT", self.since)
         if crossed == threshold.ENTRY:
             n = self.occupants + 1 if self.room == RoomState.OCCUPIED else 1
@@ -179,8 +201,15 @@ class OccupancyEngine:
                               self.since)
 
         state = self._posture.update(matrix, t).committed
+        if state == State.EMPTY:
+            self._clear_since_exit = True
         if state != State.EMPTY:
-            # a body is in the field. That is the whole argument.
+            # a body is in the field. That is the whole argument, EXCEPT
+            # immediately after an outward crossing: the departing body is still
+            # in the field on those frames, and re-latching off it is how the
+            # room ended up occupied with nobody in it.
+            if self._exited_at is not None and not self._clear_since_exit:
+                return RoomUpdate(self.room, self.occupants, event, self.since)
             if self.room != RoomState.OCCUPIED:
                 self._set_room(RoomState.OCCUPIED, 1, t)
                 event = "PRESENCE"
