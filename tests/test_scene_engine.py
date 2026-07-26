@@ -87,18 +87,36 @@ def _occupied_engine():
     ]
     interior_frame = make_frame(*interior_cells)
 
-    # Drive: doorway, then interior (enough debounce frames to lock in)
+    # These scenarios are about what happens WHILE the room is occupied, not
+    # about how it got that way. It becomes occupied by the sensor SEEING a
+    # body, which is now sufficient; it used to be driven through the old
+    # doorway-then-interior inference, and that model is gone.
     t = 0.0
-    t, _ = drive(eng, t, [(doorway_frame, SceneParams.DEBOUNCE_N),
-                           (interior_frame, SceneParams.DEBOUNCE_N)])
-    assert eng.room == RoomState.OCCUPIED, "setup: engine not OCCUPIED after entry"
+    t, _ = drive(eng, t, [(interior_frame, SceneParams.DEBOUNCE_N * 3)])
+    assert eng.room == RoomState.OCCUPIED, "setup: engine not OCCUPIED"
     return eng, t
 
 
 def main():
-    # Scenario 1: Entry from UNKNOWN
-    # Doorway frames followed by interior frames -> ENTRY_CONFIRMED, OCCUPIED.
-    eng = OccupancyEngine(baseline=DEFAULT_BASELINE)
+    # THE ENTRY AND EXIT SCENARIOS ARE GONE, not repaired. They drove the engine
+    # with hand-built frames that TELEPORT: three doorway cells at 55%% of
+    # baseline held for two frames, then seven interior cells at baseline-500
+    # held for two frames. Entry and exit are a body CROSSING THE THRESHOLD
+    # PLANE now (bathroom/threshold.py): the sign of its distance to a plane
+    # derived from the scan, confirmed by travel across it. A body that never
+    # moves never crosses, so these frames contain no crossing to detect, and
+    # asserting one from them only pinned the model that inferred entry from
+    # the DOOR. That model cannot be right about this door: it opens outward,
+    # the sensor looks straight through the frame into the hallway, and someone
+    # can open and shut it from the hallway without ever coming in.
+    #
+    # "artifact never latches" is gone for a different reason: it asserted that
+    # a body visible in the room with no observed entry must leave the room
+    # UNKNOWN. That is the rule that had the operator sitting on the toilet
+    # under `ROOM: UNKNOWN(0) 8m31s`. Seeing someone is evidence that someone
+    # is there.
+    #
+    # tests/test_crossing.py gates entry and exit on the four recorded captures.
 
     doorway_cells = [
         (1, 5, int(0.55 * DEFAULT_BASELINE[1][5])),
@@ -120,26 +138,6 @@ def main():
     empty_frame = make_frame()
 
     t = 0.0
-    t, ev = drive(eng, t, [(doorway_frame, SceneParams.DEBOUNCE_N),
-                           (interior_frame, SceneParams.DEBOUNCE_N)])
-    check(eng.room == RoomState.OCCUPIED and "ENTRY_CONFIRMED" in ev and eng.occupants == 1,
-          "entry from UNKNOWN: doorway then interior -> ENTRY_CONFIRMED, OCCUPIED, occupants=1")
-
-    # Scenario 2: Exit
-    # Continue from occupied engine, doorway frames then empty -> EXIT, EMPTY.
-    t, ev = drive(eng, t, [(doorway_frame, SceneParams.DEBOUNCE_N),
-                           (empty_frame, SceneParams.DEBOUNCE_N * 2)])
-    check(eng.room == RoomState.EMPTY and "EXIT" in ev and eng.occupants == 0,
-          "exit: occupied then doorway then empty -> EXIT, EMPTY, occupants=0")
-
-    # Scenario 3: Artifact never latches
-    # Fresh engine, interior frames from boot, then empty -> PRESENCE_NO_ENTRY, never OCCUPIED.
-    eng = OccupancyEngine(baseline=DEFAULT_BASELINE)
-    t = 0.0
-    t, ev = drive(eng, t, [(interior_frame, SceneParams.DEBOUNCE_N * 2),
-                           (empty_frame, SceneParams.DEBOUNCE_N * 2)])
-    check("PRESENCE_NO_ENTRY" in ev and eng.room == RoomState.UNKNOWN and eng.occupants == 0,
-          "artifact never latches: interior from boot stays UNKNOWN, PRESENCE_NO_ENTRY seen")
 
     # Scenario 4: Smear veto
     # Occupied engine, near-lens smear (sub-floor cells) then empty -> no EXIT, stays OCCUPIED.

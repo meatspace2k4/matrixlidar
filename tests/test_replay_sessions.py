@@ -143,39 +143,33 @@ def main():
                  "session_010: no EXIT"):
         failures.append("session_010 has EXIT")
 
-    if not check("PRESENCE_NO_ENTRY" in event_names_010,
-                 "session_010: has at least one PRESENCE_NO_ENTRY"):
-        failures.append("session_010 missing PRESENCE_NO_ENTRY")
+    # The PRESENCE_NO_ENTRY / stays-UNKNOWN assertions are gone. They pinned
+    # the rule that a body VISIBLE IN THE ROOM with no observed entry must not
+    # latch occupancy, which is the rule that had the operator sitting on the
+    # toilet under `ROOM: UNKNOWN(0) 8m31s`. Seeing someone is evidence that
+    # someone is there. What still matters here, and is kept above, is that a
+    # mid-field artifact must not be reported as somebody coming through the
+    # DOOR: no ENTRY_CONFIRMED, no EXIT.
 
-    if not check(eng_010.room == RoomState.UNKNOWN,
-                 "session_010: final room is UNKNOWN"):
-        failures.append(f"session_010 room is {eng_010.room}, not UNKNOWN")
-
-    if not check(eng_010.occupants == 0,
-                 "session_010: final occupants = 0"):
-        failures.append(f"session_010 occupants = {eng_010.occupants}, not 0")
-
-    # Test session_001: clean entry and exit through door
-    # Should confirm entry, emit exit, end EMPTY.
-    # A GAP_RESET between entry and exit is expected and acceptable.
+    # session_001's entry/exit assertions are gone, and the reason is in what
+    # this replay actually feeds. The archive stores ONE FRAME PER COMMITTED
+    # TRANSITION, and replay_with_bridge holds each of those frames constant
+    # until the next one. Entry and exit are a body CROSSING THE THRESHOLD
+    # PLANE now (bathroom/threshold.py), confirmed by travel across it, and a
+    # body that never moves never crosses. There is no crossing in this data to
+    # find: at every ENTRY_CONFIRMED the archive ever recorded, the body is
+    # already 555-871mm inside the room, and its one archived EXIT frame has no
+    # body in view at all. The old logic never saw a crossing either; it
+    # inferred one afterwards from the door's state.
+    #
+    # Entry and exit are gated on continuous recorded captures instead, in
+    # tests/test_crossing.py, where the body is actually seen moving through.
     events_001, eng_001 = replay_with_bridge(trs_001, baseline)
     event_names_001 = [ev for _, ev, _ in events_001]
 
-    if not check("ENTRY_CONFIRMED" in event_names_001,
-                 "session_001: ENTRY_CONFIRMED seen"):
-        failures.append("session_001 missing ENTRY_CONFIRMED")
-
-    if not check("EXIT" in event_names_001,
-                 "session_001: EXIT seen"):
-        failures.append("session_001 missing EXIT")
-
-    if not check(eng_001.room == RoomState.EMPTY,
-                 "session_001: final room is EMPTY"):
-        failures.append(f"session_001 room is {eng_001.room}, not EMPTY")
-
-    if not check(eng_001.occupants == 0,
-                 "session_001: final occupants = 0"):
-        failures.append(f"session_001 occupants = {eng_001.occupants}, not 0")
+    if not check("ENTRY_CONFIRMED" not in event_names_001,
+                 "session_001: no entry claimed from held transition frames"):
+        failures.append("session_001 claimed an entry from a static frame")
 
     print("ALL PASS" if not failures else "SOME FAILED")
     return 1 if failures else 0

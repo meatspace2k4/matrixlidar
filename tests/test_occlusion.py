@@ -102,11 +102,13 @@ def _occupied_engine():
     ]
     interior_frame = make_frame(*interior_cells)
 
-    # Drive: doorway, then interior (enough debounce frames to lock in)
+    # These scenarios are about what happens WHILE the room is occupied, not
+    # about how it got that way. It becomes occupied by the sensor SEEING a
+    # body, which is now sufficient; it used to be driven through the old
+    # doorway-then-interior inference, and that model is gone.
     t = 0.0
-    t, _ = drive(eng, t, [(doorway_frame, SceneParams.DEBOUNCE_N),
-                           (interior_frame, SceneParams.DEBOUNCE_N)])
-    assert eng.room == RoomState.OCCUPIED, "setup: engine not OCCUPIED after entry"
+    t, _ = drive(eng, t, [(interior_frame, SceneParams.DEBOUNCE_N * 3)])
+    assert eng.room == RoomState.OCCUPIED, "setup: engine not OCCUPIED"
     return eng, t
 
 
@@ -188,26 +190,28 @@ def main():
     check(eng.room == RoomState.OCCUPIED and "EXIT" not in ev,
           "scenario 6: alternating occluded/empty churn does not flip state, no EXIT")
 
-    # Scenario 7: Recovery after occluded run
-    # After an occluded run, a normal doorway-then-empty sequence still produces EXIT.
+    # Scenario 7: the engine RECOVERS from an occluded run rather than latching
+    # blocked. It used to assert that a doorway-then-empty sequence after the
+    # run produced an EXIT; that asserted the old model, in which an exit was
+    # inferred from three doorway-band cells at 55%% of baseline followed by an
+    # empty frame. An exit is a body crossing the threshold plane now, and
+    # these hand-built frames contain no body and no crossing. What is still
+    # worth pinning is that the blocked state clears: the run must stop being
+    # reported once the view comes back, and the room must be deciding again.
     eng, t = _occupied_engine()
 
     occluded_frame = make_occluded_frame()
-    doorway_cells = [
-        (1, 5, int(0.55 * DEFAULT_BASELINE[1][5])),
-        (2, 5, int(0.55 * DEFAULT_BASELINE[2][5])),
-        (1, 6, int(0.55 * DEFAULT_BASELINE[1][6])),
-    ]
-    doorway_frame = make_frame(*doorway_cells)
     empty_frame = make_frame()
 
-    # Feed occluded run
-    t, _ = drive(eng, t, [(occluded_frame, SceneParams.DEBOUNCE_N + 3)])
-    # Then doorway and empty
-    t, ev = drive(eng, t, [(doorway_frame, SceneParams.DEBOUNCE_N),
-                           (empty_frame, SceneParams.DEBOUNCE_N * 2)])
-    check("EXIT" in ev and eng.room == RoomState.EMPTY,
-          "scenario 7: recovery after occluded run produces correct EXIT")
+    t, ev_blocked = drive(eng, t, [(occluded_frame, SceneParams.DEBOUNCE_N + 3)])
+    check("OCCLUDED" in ev_blocked,
+          "scenario 7: a blocked run is reported while the view is blocked")
+    t, ev_clear = drive(eng, t, [(empty_frame, SceneParams.DEBOUNCE_N * 2)])
+    check("OCCLUDED" not in ev_clear,
+          "scenario 7: the blocked state clears when the view comes back")
+    t, ev_again = drive(eng, t, [(occluded_frame, SceneParams.DEBOUNCE_N + 3)])
+    check("OCCLUDED" in ev_again,
+          "scenario 7: a second blocked run is reported again, not latched off")
 
     print("ALL PASS" if not FAILS else "SOME FAILED")
     return 1 if FAILS else 0

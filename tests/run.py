@@ -23,7 +23,7 @@ ROOT = os.path.dirname(HERE)
 # the sensor never produces. Tests like that cannot fail for the right reason;
 # they only pin the implementation. The gate is test_seated.py: every attested
 # frame, per frame, against the operator's own per-frame labels.
-SCRIPTS = ["test_classify.py", "test_pipeline.py",
+SCRIPTS = ["test_classify.py", "test_pipeline.py", "test_crossing.py",
            "test_depth.py", "test_scene_engine.py", "test_replay_sessions.py",
            "test_occlusion.py", "test_seated.py"]
 GATES = [
