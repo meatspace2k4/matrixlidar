@@ -108,7 +108,10 @@ def run(predictor, samples, frame_level=False):
         if s.state is None:
             rows.append((s.id, s.label, "?", "UNLABELED (label not recognized)"))
             continue
-        truth = s.state.name
+        # clip truth is the dominant PER-FRAME truth, so a clip whose label
+        # covers a span the operator has since corrected is compared against
+        # what it actually holds (see ingest.LabeledSample.states)
+        truth = s.dominant_state().name
         if isinstance(predictor, PredictionsFilePredictor):
             pred = predictor.predict_for(s).name
             clip_pairs.append((truth, pred))
@@ -120,8 +123,9 @@ def run(predictor, samples, frame_level=False):
         pred = predictor.predict(s.frames, s.baseline).name
         clip_pairs.append((truth, pred))
         if frame_level and hasattr(predictor, "per_frame"):
-            for st in predictor.per_frame(s.frames, s.baseline):
-                frame_pairs.append((truth, st.name))
+            for want, st in zip(s.states, predictor.per_frame(s.frames, s.baseline)):
+                if want is not None:
+                    frame_pairs.append((want.name, st.name))
         rows.append((s.id, s.label, pred, "ok" if pred == truth else "MISS"))
     return clip_pairs, frame_pairs, rows
 

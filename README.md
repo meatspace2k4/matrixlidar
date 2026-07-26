@@ -24,9 +24,10 @@ oriented locally (row 0 = top, col 0 = column A).
 
 ## Two layers
 
-- Per-frame classifier (`bathroom/classify.py`): one oriented frame to one
-  state, baseline-relative (a body reads closer than the empty room at whatever
-  it occludes; the DOOR column H is excluded because it swings on its own).
+- Per-frame decision: `bathroom/classify.py` computes the features (and the
+  door/zone panel); `bathroom/posture3d.py` decides the state from them in
+  metric 3D, against a room reconstructed from the empty-room scan
+  (`bathroom/roomscan.py`, `bathroom/geometry.py`).
 - Temporal engine (`bathroom/engine.py`): debounces the classifier with
   hysteresis, adopts the first observation as its initial state, and emits a
   timeline of stable segments.
@@ -35,11 +36,27 @@ oriented locally (row 0 = top, col 0 = column A).
 
 | State | What | How detected |
 |---|---|---|
-| `EMPTY` | no body | almost no occluded cells, or a tiny co-located noise cluster |
-| `WALKING` | body crossing close in front of the sensor | many very-near cells, or near cells spanning >=4 columns |
-| `STANDING_AT_TOILET` | upright between toilet and door | headroom row occluded deeply, with occupied torso cells below the head |
-| `SITTING_AT_TOILET` | seated on the toilet | no supported head-over-torso signal, occluded cells cluster low; the toilet zone alone is not sufficient |
-| `UNKNOWN` | body present, no clean posture | returned instead of a confident wrong label |
+| `EMPTY` | no body | fewer than `MIN_BODY` body cells, counting occluded rays |
+| `WALKING` | body crossing in front of the sensor | not at the toilet in plan, and its nearest point is inside the pass-by band |
+| `STANDING_AT_TOILET` | upright at the toilet | body's plan centroid within `AT_FIXTURE_MM` of the reconstructed toilet |
+| `SITTING_AT_TOILET` | seated on the toilet | `SEAT_FRAC` or more of the body's evidence lies in the air directly above the reconstructed seat |
+| `UNKNOWN` | body present, neither at the toilet nor crossing | returned instead of a confident wrong label |
+
+Two facts about this sensor drive the posture decision, and both cost a lot to
+learn (details and the dead hypotheses are in `bathroom/posture3d.py`):
+
+- **A no-return cell is evidence of a body, not of an empty room.** A cell
+  reading 4000 where the scan has a solid return at 1300-1700mm did not see
+  nothing; something absorbed the beam. A seated torso is exactly what stops
+  returning: counting returns only, a seated body scores 2-22 cells and drops
+  under any presence floor in 19 of 119 attested seated frames. Counting
+  returns *plus* occluded rays, the same frames never score below 10 while an
+  empty room scores 0-6.
+- **A body sitting on the seat cannot read 300mm nearer than the seat**, so
+  "something person-shaped on top of the seat" is not a detectable event. What
+  is detectable is that the body's evidence is *concentrated in the column
+  above* the seat: 0.36-0.68 of it when seated, median 0.08 when standing at
+  the same toilet.
 
 Door state is separate: `open%` from column H (1090mm = 0%, >=1400mm = 100%).
 A body in the doorway splits the column; those frames hold the last coherent
@@ -124,6 +141,20 @@ Model predictions are JSONL keyed by sample id: `{"id": "sitting_seed", "pred":
 confusion matrix (`bathroom/metrics.py`). Labeled snapshots come from
 `fixtures/labeled/` and `data/clips/` (`bathroom/ingest.py`).
 
+Ground truth is PER FRAME. A capture labeled `walking` opens with the operator
+not yet in the room and one labeled `sitting` opens with the walk in; scoring
+those frames against the clip's single label measures the label's coarseness,
+not the classifier. `corrections` (written by `review --relabel`) is where the
+operator says which span is which, and `ingest` applies them, so a clip's
+clip-level truth is the dominant per-frame truth rather than its filename.
+
+Beware transition-frame fixtures (`fixtures/misdetections/`): the Pi's archive
+stores one frame per committed state change, so a frame the classifier called
+UNKNOWN mid-posture leaves no transition and cannot appear. Sampling them by
+`mark.to` measures the classifier on the frames it already got right. This is
+how a 93%-passing seated regression coexisted with 146 unbroken seconds of
+`STATE: UNKNOWN` during an attested sit.
+
 ### Corpus tools
 
 ```
@@ -174,7 +205,10 @@ bathroom/
   zones.py               zones + State vocabulary + label aliases
   stream.py              warm-TCP reader -> oriented frames (auto-reconnect)
   detect.py              door open% + per-zone values
-  classify.py            per-frame classifier (baseline-relative)
+  geometry.py            unproject the depth map into metric 3D (rays, planes)
+  roomscan.py            the empty room read off the scan: gravity, floor, fixture
+  posture3d.py           the posture decision, metric (seat column, plan position)
+  classify.py            per-frame features + the state seam
   engine.py              temporal state machine (debounce, timeline) + CLI
   occupancy.py           room occupancy engine (UNKNOWN/EMPTY/OCCUPIED + events)
   archive.py             forward committed transitions to the Pi's RAM archive
