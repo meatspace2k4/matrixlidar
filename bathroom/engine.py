@@ -57,9 +57,12 @@ class Segment:
 
 class Update:
     """One engine step's result (what live views and recorders consume)."""
-    __slots__ = ("committed", "instant", "changed", "event", "features", "t")
+    __slots__ = ("committed", "instant", "changed", "event", "features", "t",
+                 "matrix")
 
-    def __init__(self, committed, instant, changed, event, features, t):
+    def __init__(self, committed, instant, changed, event, features, t,
+                 matrix=None):
+        self.matrix = matrix            # the oriented frame this Update is for
         self.committed = committed      # the debounced, stable state
         self.instant = instant          # this frame's raw classifier state
         self.changed = changed          # True on the frame a transition commits
@@ -75,7 +78,14 @@ class StateEngine:
                  before the committed state flips (hysteresis against flicker).
     """
 
-    def __init__(self, baseline=None, commit_after=4, start=State.EMPTY):
+    def __init__(self, baseline=None, commit_after=4, start=State.EMPTY,
+                 classifier=None):
+        # `classifier` exists because the washlet daemon on the Pi passes one:
+        # it used to swap the posture verdict in from a parallel module while
+        # leaving classify.py's features alone. classify.classify IS that path
+        # now, so the default is the only one anybody needs, and a daemon that
+        # still passes its wrapper keeps working.
+        self._classify = classifier or classify
         self.baseline = baseline
         self.commit_after = commit_after
         self.committed = start
@@ -85,7 +95,16 @@ class StateEngine:
         self._cand_n = 0
 
     def update(self, matrix, t):
-        instant, feats = classify(matrix, self.baseline)
+        if self._classify is classify:
+            instant, feats = classify(matrix, self.baseline)
+        else:
+            # A supplied classifier is the washlet daemon's wrapper, written
+            # against the old classify_window(frames, baseline) signature from
+            # when this engine kept a rolling median window. It does not any
+            # more (a median across raw frames invents a grid that existed at no
+            # instant, which is what produced the SITTING<->STANDING flapping),
+            # so it gets a window of one: median_window([m]) is m.
+            instant, feats = self._classify([matrix], self.baseline)
 
         if self.current is None:
             # Bootstrap: adopt the first observation as the initial state. There
@@ -119,7 +138,8 @@ class StateEngine:
 
         self.current.t_end = t
         self.current.n_frames += 1
-        return Update(self.committed, instant, changed, event, feats, t)
+        return Update(self.committed, instant, changed, event, feats, t,
+                      matrix=matrix)
 
     def close(self, t=None):
         """Finalize the open segment (call at end of stream/clip)."""

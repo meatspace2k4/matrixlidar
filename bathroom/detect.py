@@ -105,8 +105,13 @@ def door_open_angle(matrix, baseline):
     return math.degrees(math.acos(max(-1.0, min(1.0, abs(dot)))))
 
 
-def door_open_pct(matrix, baseline):
+def door_open_pct(matrix, baseline=None):
     """`door_open_angle` as a percentage of a door's travel, or None.
+
+    `baseline` defaults to the empty-room scan, because the washlet daemon on
+    the Pi calls this with the matrix alone. The angle is measured against the
+    jamb, which the scan locates, so there is nothing to substitute if it is
+    missing: config.load_baseline raises rather than inventing one.
 
     SWING_DEG is 90 by construction of a door, not by measurement: the two
     calibration captures pin 0% (panel parallel to the jamb) and 100% (no panel
@@ -114,6 +119,9 @@ def door_open_pct(matrix, baseline):
     between them is geometry rather than something fitted. One named constant
     in place of the two unattached literals it replaces.
     """
+    if baseline is None:
+        from . import config
+        baseline = config.load_baseline()
     deg = door_open_angle(matrix, baseline)
     if deg is None:
         return None

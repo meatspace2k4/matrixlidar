@@ -2,7 +2,7 @@
 
 Two inputs, and both of them measure a BODY:
 
-  bathroom/posture.py    is there a body in the field
+  bathroom/posture3d.py    is there a body in the field
   bathroom/threshold.py  did a body cross the door plane, and which way
 
 That is the whole model.
@@ -85,7 +85,15 @@ class RoomUpdate:
 class OccupancyEngine:
     """Feed it oriented frames; it says whether the room is occupied."""
 
-    def __init__(self, baseline):
+    def __init__(self, baseline=None):
+        # The washlet daemon constructs this with no argument. That is fine: it
+        # loads the same scan every other entrypoint loads. config.load_baseline
+        # RAISES on a missing or corrupt scan rather than substituting one, so
+        # this is not the old silent fallback to DEFAULT_BASELINE that had the
+        # room engine measuring a pre-move pose while posture used the real one.
+        if baseline is None:
+            from . import config
+            baseline = config.load_baseline()
         # required, never defaulted. It used to default to None, which
         # scene.read_frame resolved to classify.DEFAULT_BASELINE, and BOTH live
         # front-ends constructed this with no argument: the room engine ran
@@ -121,10 +129,15 @@ class OccupancyEngine:
         self.room = room
         self.occupants = occupants
 
-    def update(self, matrix, t, door_pct=None):
-        """One oriented frame. `door_pct` is accepted and ignored: the panel is
-        telemetry, it is operated from both sides and obscured by whoever
-        operates it, and it never decides occupancy."""
+    def update(self, frame, t, door_pct=None, crossed_out=False):
+        """One frame. Accepts either an oriented 8x8 matrix or an engine.Update
+        (the washlet daemon passes the latter), so the daemon's call site is
+        unchanged. `door_pct` is accepted and ignored: the panel is telemetry,
+        operated from both sides and obscured by whoever operates it, and it
+        never decides occupancy. `crossed_out` is likewise accepted and ignored:
+        the door-plane crossing is computed here now, from the frame, instead of
+        being computed twice and passed back in."""
+        matrix = getattr(frame, "matrix", frame)
         event = None
         if self._last_t is not None and t - self._last_t > Params.T_GAP:
             # unobserved stretch: nothing about the room can be attested

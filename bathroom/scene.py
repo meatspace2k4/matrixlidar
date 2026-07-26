@@ -97,6 +97,7 @@ Event automaton (SceneAutomaton)
 """
 
 from .classify import DEFAULT_BASELINE, _eff_base
+from .roomscan import Scene, SceneError   # noqa: F401  (the daemon does scene.Scene)
 from .zones import N, NO_TARGET, label
 
 

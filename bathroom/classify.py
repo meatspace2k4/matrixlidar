@@ -32,7 +32,7 @@ operator-narrated sitting frames of the 2026-07-26 09:00 session those cells
 moved 0-299mm and `lower_at_fixture` scored 0 in every one; the state came out
 UNKNOWN for 146 consecutive seconds of an attested sit. Across the whole
 labeled corpus the row-band rule recovered 162 of 323 attested sitting frames
-and sent 153 of them to UNKNOWN. bathroom.posture recovers 316 of 323.
+and sent 153 of them to UNKNOWN. bathroom.posture3d recovers 316 of 323.
 
 `row_band_state` is kept, exercised and reported so the two can be compared on
 live data, not because it is a fallback worth trusting for posture.
@@ -42,7 +42,7 @@ corpus. This module is pure (no I/O).
 """
 import statistics
 
-from . import posture
+from . import posture3d
 from .zones import N, NO_TARGET, DOOR_COL, ZONE_CELLS, Zone, State
 
 
@@ -232,7 +232,7 @@ def row_band_state(f):
     so it never can. In the four operator-narrated sitting frames of the 09:00
     session the seat cells moved 0-299mm against a 300mm cut and
     `lower_at_fixture` scored 0 every time; the state came out UNKNOWN for 146
-    consecutive seconds of an attested sit. posture.classify replaces it.
+    consecutive seconds of an attested sit. posture3d.classify replaces it.
     """
     min_mm = f["min_mm"] if f["min_mm"] is not None else NO_TARGET
     if f["occ_count"] <= Params.EMPTY_MAX or f["noise_cluster"]:
@@ -266,6 +266,6 @@ def classify(matrix, baseline):
     base = baseline
     f = features(matrix, base)
     f["row_band_state"] = row_band_state(f).name
-    state, shape = posture.classify(matrix, base)
+    state, shape = posture3d.classify(matrix, base)
     f.update(shape)
     return state, f
