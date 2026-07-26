@@ -85,12 +85,28 @@ def main():
             f.write("{not json")
         check(len(list(dataset.iter_clips(d))) == 2, "corrupt clip skipped, others survive")
 
-    # robustness: bad baseline file -> built-in default, no crash
+    # A corrupt baseline must RAISE. This check used to assert the opposite
+    # ("corrupt baseline falls back to default"), added one commit after the
+    # fallback itself, which made the footgun a specification: removing it
+    # turned the suite red, and a red suite is what stops anyone from removing
+    # it. Everything downstream measures depth against this grid, so a
+    # substitute scan is not a degraded answer, it is a confident answer about
+    # a different room.
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         f.write("{garbage")
         bad = f.name
-    check(config.load_baseline(bad) == DEFAULT_BASELINE, "corrupt baseline falls back to default")
+    try:
+        config.load_baseline(bad)
+        check(False, "corrupt baseline must raise, not substitute a scan")
+    except config.BaselineError:
+        check(True, "corrupt baseline raises BaselineError")
     os.unlink(bad)
+    missing = bad + ".nope"
+    try:
+        config.load_baseline(missing)
+        check(False, "missing baseline must raise, not substitute a scan")
+    except config.BaselineError:
+        check(True, "missing baseline raises BaselineError")
 
     # empty-window guard
     try:

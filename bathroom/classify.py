@@ -42,7 +42,7 @@ corpus. This module is pure (no I/O).
 """
 import statistics
 
-from . import posture3d, roomscan
+from . import posture3d
 from .zones import N, NO_TARGET, DOOR_COL, ZONE_CELLS, Zone, State
 
 
@@ -94,10 +94,17 @@ class Params:
                             # closer. Sitting requires |body - seat| <= this.
 
 
-# Default empty-room baseline: the labeled door-CLOSED capture
-# (~/snapshots/labeled.jsonl), a clean unoccupied frame. The single 4000 is a
-# dropout, handled by BASELINE_CAP. Operators capture their own with
-# `python3 -m bathroom.record --baseline`; this is the fallback.
+# A HISTORICAL empty-room scan: the labeled door-CLOSED capture from ~2026-07-01
+# (~/snapshots/labeled.jsonl). The single 4000 is a dropout, handled by
+# BASELINE_CAP.
+#
+# NOT a default and NOT a fallback. It describes a sensor pose that no longer
+# exists: its toilet sits one column left of where the current scan puts it,
+# wrong by up to 514mm on the fixture's own cells. It is kept because the four
+# pre-move seed fixtures were captured in it and are only meaningful against it,
+# so those samples name it explicitly. Nothing resolves to it implicitly:
+# config.load_baseline() raises instead, and classify()/features() require the
+# caller to say which room they mean.
 DEFAULT_BASELINE = [
     [1115, 1185, 1290, 1400, 1318, 1163, 1155, 1044],
     [1210, 1343, 1453, 1496, 1303, 1155, 1152, 1050],
@@ -123,10 +130,15 @@ def median_window(frames):
              for c in range(N)] for r in range(N)]
 
 
-def features(matrix, baseline=None):
+def features(matrix, baseline):
     """Presence features used by the decision rule. Plain dict so it can be
-    logged alongside the state for audit. DOOR column excluded throughout."""
-    base = baseline or DEFAULT_BASELINE
+    logged alongside the state for audit. DOOR column excluded throughout.
+
+    `baseline` is required. It used to default to DEFAULT_BASELINE, i.e. a call
+    that forgot it silently measured this frame against a room that no longer
+    exists and returned a plausible-looking answer.
+    """
+    base = baseline
     occ = []          # (r, c) occupied cells (closer than baseline by DELTA_MM)
     deep = set()      # of those, the deeply occluded ones (>= DEEP_DELTA)
     vnear = 0         # cells essentially at the sensor (< VNEAR_MM)
@@ -244,7 +256,7 @@ def row_band_state(f):
     return State.UNKNOWN
 
 
-def classify(matrix, baseline=None):
+def classify(matrix, baseline):
     """Map an oriented frame to a (State, features) pair.
 
     The STATE comes from bathroom.posture3d, which unprojects the frame into
@@ -254,15 +266,16 @@ def classify(matrix, baseline=None):
     their own keys, and `row_band_state` is reported alongside so the two
     decisions can be compared on live data.
     """
-    base = baseline or DEFAULT_BASELINE
+    base = baseline
     f = features(matrix, base)
     f["row_band_state"] = row_band_state(f).name
-    try:
-        state, f3d = posture3d.classify(matrix, base)
-    except roomscan.SceneError as e:
-        # a baseline the metric model cannot read is a real fault, but it must
-        # not take the room engine down with it: fall back, and say so.
-        f["scene_error"] = str(e)
-        return row_band_state(f), f
+    # roomscan.SceneError is NOT caught here. An earlier revision of this
+    # function caught it and returned row_band_state(f) instead, which silently
+    # degrades to the classifier this whole change exists because it cannot
+    # detect sitting: the operator would watch STATE: UNKNOWN through another
+    # sit with nothing on screen to say why. A baseline the metric model cannot
+    # read is a fault to fix, and posture3d.preflight() exists so it surfaces at
+    # startup rather than on frame 1.
+    state, f3d = posture3d.classify(matrix, base)
     f.update(f3d)
     return state, f

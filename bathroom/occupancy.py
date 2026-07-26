@@ -44,7 +44,13 @@ class RoomUpdate:
 
 
 class OccupancyEngine:
-    def __init__(self, baseline=None):
+    def __init__(self, baseline):
+        # required. It defaulted to None, which scene.read_frame then silently
+        # resolved to classify.DEFAULT_BASELINE: BOTH live front-ends
+        # constructed this with no argument, so the room engine has been
+        # measuring the door and the passage against a pre-move scan (wrong by
+        # up to 514mm on the fixture) while the posture path used the real one.
+        # Nothing reported it, because a wrong baseline yields plausible states.
         self.baseline = baseline
         self.room = RoomState.UNKNOWN
         self.occupants = 0

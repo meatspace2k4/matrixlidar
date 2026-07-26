@@ -5,7 +5,8 @@ sessions (see that commit); lab/validate_scene.py remains the replay
 validator.
 
 Reads each oriented 8x8 frame directly against the static scene
-(classify.DEFAULT_BASELINE, byte-identical to baselines/empty.json) and
+(the empty-room scan; classify.DEFAULT_BASELINE is a pre-move scan and is
+not interchangeable with it) and
 reduces it to a SceneReading:
 
     interior_body : bool + cells   a body inside the room
@@ -124,9 +125,9 @@ class Params:
     PANEL_CLOSED_HI = 1.12   # H median within [0.95, this] * baseline
 
 
-def passage_band(baseline=None):
+def passage_band(baseline):
     """{(r, c): (lo_mm, hi_mm)} for every doorway-ray cell."""
-    base = baseline or DEFAULT_BASELINE
+    base = baseline
     band = {}
     for r in range(N):
         for c in Params.DOORWAY_COLS:
@@ -135,9 +136,9 @@ def passage_band(baseline=None):
     return band
 
 
-def door_panel_state(matrix, baseline=None):
+def door_panel_state(matrix, baseline):
     """Coarse per-frame panel state from column H. Informational only."""
-    base = baseline or DEFAULT_BASELINE
+    base = baseline
     ratios = []
     occluded = 0
     for r in range(N):
@@ -187,9 +188,9 @@ class SceneReading:
                                             # positive evidence of a body
 
 
-def read_frame(matrix, baseline=None):
+def read_frame(matrix, baseline):
     """Reduce one oriented frame to a SceneReading. Pure, per-frame."""
-    base = baseline or DEFAULT_BASELINE
+    base = baseline
     interior = []   # (label, mm) body cells, columns A-E
     in_band = []    # (label, mm, lo, hi) doorway-ray body cells in the band
     sub_floor = []  # (label, mm) doorway-ray body cells below the floor

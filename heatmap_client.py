@@ -14,7 +14,7 @@ import sys
 import time
 from collections import deque
 
-from bathroom import archive, config, detect, occupancy, sparkline, stream
+from bathroom import archive, config, detect, occupancy, posture3d, roomscan, sparkline, stream
 from bathroom.engine import StateEngine
 from bathroom.live import DRIFT_FRAMES, _direction
 from bathroom.zones import N, NO_TARGET, State, Zone
@@ -102,9 +102,16 @@ def _waiting(attempt, total):
 
 
 def main():
-    baseline = config.load_baseline()
+    try:
+        baseline = config.load_baseline()
+        # build the metric scene up front too, so a baseline the 3D model
+        # cannot read surfaces here and not on frame 1
+        sys.stderr.write("%s\n" % posture3d.preflight(baseline))
+    except (config.BaselineError, roomscan.SceneError) as e:
+        sys.stderr.write("%s\n" % e)
+        return 1
     eng = StateEngine(baseline=baseline)
-    room_eng = occupancy.OccupancyEngine()
+    room_eng = occupancy.OccupancyEngine(baseline=baseline)
     marker = archive.Marker()
     occ_hist = deque(maxlen=HIST)
     state_hist = deque(maxlen=HIST)

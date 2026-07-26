@@ -12,7 +12,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bathroom.classify import classify          # noqa: E402
+from bathroom.classify import classify, DEFAULT_BASELINE  # noqa: E402
+
+# these four seeds were captured in the PRE-MOVE scene, so that is the scan
+# they are meaningful against; see classify.DEFAULT_BASELINE.
+BASELINE = DEFAULT_BASELINE
 from bathroom.zones import State                 # noqa: E402
 
 # Screenshot 1 surrogate: a real live empty-room frame (door closed).
@@ -74,7 +78,7 @@ CASES = [
 def main():
     ok = True
     for name, frame, expected in CASES:
-        got, f = classify(frame)
+        got, f = classify(frame, BASELINE)
         flag = "PASS" if got == expected else "FAIL"
         if got != expected:
             ok = False

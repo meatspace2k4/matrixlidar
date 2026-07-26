@@ -91,7 +91,7 @@ NEVER_SITTING = [
 def main():
     ok = True
     for name, frame, expected in CASES:
-        got, f = classify(frame)
+        got, f = classify(frame, BASE)
         flag = "PASS" if got == expected else "FAIL"
         if got != expected:
             ok = False
@@ -101,7 +101,7 @@ def main():
                  f["vnear_count"], f["deep_upper"], f["lower_count"],
                  f["near_cols"], int(f["noise_cluster"])))
     for name, frame in NEVER_SITTING:
-        got, f = classify(frame)
+        got, f = classify(frame, BASE)
         bad = got == State.SITTING_AT_TOILET
         ok = ok and not bad
         print("%-4s %-22s makes no toilet-sitting claim (got %s, seat_frac=%.2f)"
