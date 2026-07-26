@@ -51,14 +51,21 @@ async def fade_out(atv, from_volume, seconds=2.0, steps=20):
         await asyncio.sleep(seconds / steps)
 
 
-async def play(path, address, volume=20, timeout=5, on_start=None):
+async def play(path, address, volume=20, timeout=5, on_start=None,
+               on_connect=None):
     """Stream `path` to `address` at `volume`, returning when it finishes.
+
+    `on_connect(atv)` is called with the live connection before streaming, which
+    is how a fade reaches the session that is actually playing. Without it the
+    fade has nothing to set the volume on.
 
     Cancel the task to stop playback: stream_file is cancellable and the
     connection is closed on the way out either way.
     """
     loop = asyncio.get_running_loop()
     atv = await _connect(address, loop, timeout)
+    if on_connect:
+        on_connect(atv)
     try:
         # BEFORE stream_file, on this connection. This is the whole point.
         await atv.audio.set_volume(float(volume))
@@ -96,18 +103,24 @@ class Playback:
         def run():
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
+            self._volume = volume
             self._task = self._loop.create_task(
-                play(path, address, volume=volume, on_start=on_start))
+                play(path, address, volume=volume, on_start=on_start,
+                     on_connect=self._took_connection))
             try:
                 self._loop.run_until_complete(self._task)
             except (asyncio.CancelledError, PlayError, Exception):
                 pass
             finally:
+                self._atv = None
                 self._loop.close()
                 self._done.set()
 
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
+
+    def _took_connection(self, atv):
+        self._atv = atv
 
     def is_playing(self):
         return bool(self._done) and not self._done.is_set()
