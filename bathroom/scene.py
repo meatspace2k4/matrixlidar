@@ -378,7 +378,16 @@ class SceneAutomaton:
                                "since_event": t - self.pending})
                 self.occupied = True
                 self.pending = None
-            elif not self.interior.value and not self.door.value:
+            elif (not self.interior.value and not self.door.value
+                    and not reading.interior_body):
+                # the raw reading vetoes the exit. The debounced interior lags
+                # the debounced doorway by a frame on the way IN, so an entry
+                # hit the instant where the doorway had already fallen and the
+                # interior had not yet risen, and resolved as EXITED one frame
+                # before it would have become ENTERED. Traced at t=5.71 of the
+                # walk-in: 14 interior cells in the raw frame, debounced value
+                # still False. An exit means nothing is inside, so a frame that
+                # plainly shows a body inside cannot be one.
                 events.append({"t": t, "kind": "EXITED",
                                "was_occupied": self.occupied,
                                "since_event": t - self.pending,
