@@ -38,7 +38,7 @@ import sys
 import threading
 import time
 
-from . import classify, config, detect, occupancy, player as player_mod, posture3d, scene as scene_mod, stream, threshold
+from . import archive, classify, config, detect, occupancy, player as player_mod, posture3d, scene as scene_mod, stream, threshold
 from .donewith import DoneWith, FADE
 from .engine import StateEngine
 from .occupancy import RoomState
@@ -300,6 +300,12 @@ def main():
     # The fade needs pyatv, which lives in the venv. If this interpreter cannot
     # reach it, say so at startup and keep the old cut-on-exit behaviour rather
     # than silently cutting where a fade was asked for.
+    # THE DAEMON MARKS. Nothing did, until now: archive.Marker was only ever
+    # constructed by heatmap_client and bathroom.live, so the Pi's frame ring
+    # was filled by whichever viewer happened to be running, and when those were
+    # made read-only the archive went silent. A false SITTING at 13:37:05 burned
+    # the play latch and left no frame to replay.
+    marker = archive.Marker()
     fader = None
     if not args.dry_run:
         if player_mod.available():
@@ -352,6 +358,7 @@ def main():
             if rc is not None:
                 _log("player ended rc=%d" % rc)
 
+            marker.update(u, ru, t)
             if done.update(u.committed) == FADE:
                 _log("FADE done with the toilet, 2s out")
                 if fader is not None:
