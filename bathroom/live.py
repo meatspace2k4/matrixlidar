@@ -16,7 +16,7 @@ import time
 from collections import deque
 
 from . import config, detect, occupancy, stream, sparkline
-from .engine import StateEngine
+from .classify import features
 from .zones import State
 
 HIST = 32  # columns of rolling history in the sparkline + state strip
@@ -39,9 +39,7 @@ def _direction(col_hist):
 def main():
     ap = argparse.ArgumentParser(description="Live e2e state readout with sparkline")
     ap.add_argument("--verbose", action="store_true",
-                    help="log the feature vector on each committed transition")
-    ap.add_argument("--commit-after", type=int, default=4,
-                    help="frames a candidate must hold before the state flips")
+                    help="log the feature vector on each published transition")
     args = ap.parse_args()
 
     try:
@@ -49,52 +47,64 @@ def main():
     except config.BaselineError as e:
         sys.stderr.write("%s\n" % e)
         return 1
-    eng = StateEngine(baseline=baseline, commit_after=args.commit_after)
-    room_eng = occupancy.OccupancyEngine(baseline=baseline)
+    # THE DAEMON DERIVES, THE VIEWER DISPLAYS. Same rule as heatmap_client:
+    # this readout used to run its own StateEngine + OccupancyEngine over the
+    # stream and diverge from the daemon. STATE/ROOM now come from the
+    # daemon's published feed; the per-frame features below are display
+    # telemetry (sparkline, direction arrow), never state.
     door = detect.DoorReading(baseline)
     occ_hist = deque(maxlen=HIST)
     state_hist = deque(maxlen=HIST)
     col_hist = deque(maxlen=DRIFT_FRAMES)
-    t0 = None
+    last_shown = None   # (posture, room) last logged to scrollback
+    room_shown = None
+    room_since = None
     try:
         for m in stream.frames(on_wait=_waiting):
             now = time.time()
-            t0 = t0 if t0 is not None else now
-            u = eng.update(m, now - t0)
-            door_pct = door.update(m)
-            ru = room_eng.update(m, now - t0, door_pct=door_pct)
-            occ_hist.append(u.features["occ_count"])
-            state_hist.append(u.committed)
-            cells = u.features["occ_cells"]
+            f = features(m, baseline)
+            door.update(m)
+            occ_hist.append(f["occ_count"])
+            cells = f["occ_cells"]
             if cells:
                 col_hist.append(sum(c for _r, c in cells) / float(len(cells)))
             else:
                 col_hist.clear()
 
-            if ru.event is not None:
-                sys.stdout.write("\r\x1b[K%s  room -> %-9s (%s)\n"
-                                 % (time.strftime("%H:%M:%S"), ru.room, ru.event))
-            if u.changed and u.event is not None:
-                sys.stdout.write("\r\x1b[K%s  %-18s -> %-18s (%.1fs)\n"
-                                 % (time.strftime("%H:%M:%S"), u.event.state.name,
-                                    u.committed.name, u.event.duration))
-                if args.verbose:
-                    f = u.features
-                    sys.stdout.write("           occ=%d vnear=%d up=%d low=%d toto=%d min=%s\n"
-                                     % (f["occ_count"], f["vnear_count"], f["upper_count"],
-                                        f["lower_count"], int(f["toto_occluded"]), f["min_mm"]))
-
-            shown = u.committed.name
-            if u.committed == State.WALKING:
-                shown += _direction(col_hist)   # '<-' left / '->' right
-            room_txt = "%s(%d) %s" % (ru.room, ru.occupants,
-                                      occupancy.fmt_duration((now - t0) - ru.since))
-            if ru.event == "OCCLUDED":
-                shown = "VIEW BLOCKED"
+            st = stream.state()
+            if st is None:
+                posture, room, occupants = "UNKNOWN", None, 0
+                shown = "NO STATE FEED"
+                room_txt = "(daemon not publishing)"
+                state_hist.append(State.UNKNOWN)
+            else:
+                posture = st.get("posture", "UNKNOWN")
+                room, occupants = st.get("room"), st.get("occupants", 0)
+                state_hist.append(State[posture] if posture in State.__members__
+                                  else State.UNKNOWN)
+                if room != room_shown:
+                    room_shown, room_since = room, now
+                if (posture, room) != last_shown:
+                    if last_shown is not None:
+                        sys.stdout.write("\r\x1b[K%s  %-18s room=%-9s%s\n"
+                                         % (time.strftime("%H:%M:%S"), posture,
+                                            room, (" (%s)" % st["event"])
+                                            if st.get("event") else ""))
+                        if args.verbose:
+                            sys.stdout.write("           occ=%d vnear=%d up=%d low=%d toto=%d min=%s\n"
+                                             % (f["occ_count"], f["vnear_count"], f["upper_count"],
+                                                f["lower_count"], int(f["toto_occluded"]), f["min_mm"]))
+                    last_shown = (posture, room)
+                shown = posture
+                if st.get("event") == "OCCLUDED":
+                    shown = "VIEW BLOCKED"
+                elif posture == State.WALKING.name:
+                    shown += _direction(col_hist)   # '<-' left / '->' right
+                room_txt = "%s(%d) %s" % (room, occupants,
+                                          occupancy.fmt_duration(now - room_since))
             door_txt = ("  --" if door.pct is None
                         else "%3.0f%%%s" % (door.pct, "" if door.coherent else "*"))
-            lead = "%-20s %-21s inst=%-18s door=%-5s " % (
-                room_txt, shown, u.instant.name, door_txt)
+            lead = "%-20s %-21s door=%-5s " % (room_txt, shown, door_txt)
             # fit the line to the terminal: a wrapped line cannot be
             # rewritten with \r and scrolls a new row per frame instead
             cols = shutil.get_terminal_size(fallback=(120, 24)).columns
@@ -113,11 +123,7 @@ def main():
             sys.stdout.write("\r\x1b[K%s%s" % (lead, spark))
             sys.stdout.flush()
     except (KeyboardInterrupt, ConnectionError) as e:
-        eng.close()
-        sys.stdout.write("\n\nsession timeline:\n")
-        for s in eng.segments():
-            sys.stdout.write("  %-18s %6.1fs  %4d frames\n"
-                             % (s["state"], s["duration"], s["n_frames"]))
+        sys.stdout.write("\n")
         if isinstance(e, ConnectionError):
             sys.stdout.write("%s\n" % e)
     return 0

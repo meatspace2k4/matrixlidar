@@ -9,6 +9,7 @@ port is never stolen from the server (unlike the direct-serial snapshot tool).
 `frames()` yields oriented matrices (display orientation, row 0 = top, col 0 =
 column A) and transparently reconnects if the Pi reboots or the link drops.
 """
+import json
 import socket
 import time
 
@@ -24,6 +25,20 @@ MAX_ATTEMPTS = 60  # ~ covers a full Pi reboot
 
 _cached_ip = None  # last good peer IP; skips slow .local mDNS on reconnects
 _sock = None       # the socket frames() is currently reading (for send())
+
+# The detection daemon's published state, rebroadcast by the server as
+# "STATE <json>" lines on the same stream. Viewers DISPLAY this; they do not
+# run their own engines (the whole v3.00 rule). Updated by frames().
+last_state = None     # dict from the daemon's most recent STATE line
+last_state_ts = None  # time.time() when it arrived
+STATE_STALE_S = 5.0   # daemon heartbeats at 1s; older than this means no feed
+
+
+def state():
+    """The daemon's published state, or None if absent/stale."""
+    if last_state is None or time.time() - last_state_ts > STATE_STALE_S:
+        return None
+    return last_state
 
 
 def send(line):
@@ -94,9 +109,18 @@ def frames(host=HOST, port=PORT, on_wait=None):
             raise ConnectionError("could not reach %s:%d after %d attempts"
                                   % (host, port, MAX_ATTEMPTS))
         _sock = sock
+        global last_state, last_state_ts
         try:
+            send("WHAT")  # prime: current state now, not at the next heartbeat
             with sock.makefile("r") as f:
                 for line in f:
+                    if line.startswith("STATE "):
+                        try:
+                            last_state = json.loads(line[6:])
+                            last_state_ts = time.time()
+                        except ValueError:
+                            pass
+                        continue
                     parts = line.strip().split(",")
                     if len(parts) != N * N:
                         continue
