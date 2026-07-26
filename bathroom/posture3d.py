@@ -63,6 +63,27 @@ TOP_ROW = 0
 # body distance, and a margin behind the seat) that together scored the same.
 SEAT_ADVANCE_FRAC = 0.20
 SEAT_ADVANCE_MIN = 1
+# A STANDING BODY WHOSE TOP ROW BLINKS IS STILL STANDING.
+#
+# The sit/stand split was the top row alone, and one row is not enough to carry
+# it. Inside 27 seconds of attested standing, four consecutive frames lost their
+# top-row cell while everything else held: 26 cells, rows 2-8, seat reading
+# unchanged. The classifier called it SITTING, the daemon committed it, PLAY
+# fired, and the one-shot latch was spent 45 seconds before the operator
+# actually sat down.
+#
+# What separates the two is size, and only for frames that have lost the top
+# row. Standing bodies that blink are 25-28 cells; 98.5% of attested sitting is
+# under 24.
+#
+#     attested sitting       7-29 cells, median 13
+#     attested standing     15-33 cells, median 22
+#     standing, top row absent (9 frames)     25-28 cells
+#
+# So a body that has lost its top row and is still standing-sized has not sat
+# down, and it reads STANDING, not UNKNOWN. A body the sensor can plainly see is
+# never UNKNOWN: that was the whole complaint this file exists to answer.
+UPRIGHT_CELLS = 24
 BLOCKED_FRACTION = 0.5  # more than half the rays THE SCAN ANSWERS coming back
                         # dead is not a body, it is something over the sensor.
                         # The largest attested body leaves 12 rays dead; a
@@ -242,14 +263,16 @@ def classify(matrix, baseline):
     if f["present"] < BODY_MIN:
         return State.EMPTY, f
 
-    if not f["touches_top"]:
-        # The shape does not reach the top of the frame, so the body is low. Is
-        # it on the seat? Ask the seat, against its own baseline.
-        if f["seat_advance"] >= SEAT_ADVANCE_MIN:
-            return State.SITTING_AT_TOILET, f
-        return State.UNKNOWN, f
+    # Low AND small AND on the seat: sitting. Small matters because a standing
+    # body that merely blinks its top row is still standing-sized (see
+    # UPRIGHT_CELLS), and it must not read as a sit.
+    if (not f["touches_top"] and f["body_cells"] < UPRIGHT_CELLS
+            and f["seat_advance"] >= SEAT_ADVANCE_MIN):
+        return State.SITTING_AT_TOILET, f
 
-    # upright body: at the lens, or at the toilet
+    # Everything else the sensor can see is an upright body: at the lens, or at
+    # the toilet. There is no UNKNOWN here. A body in plain view always gets a
+    # posture; only a blocked view above declines to answer.
     if f["body_mm"] is not None and f["body_mm"] < LENS_MM:
         return State.WALKING, f
     return State.STANDING_AT_TOILET, f
