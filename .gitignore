@@ -4,4 +4,10 @@ __pycache__/
 # recorded clips + manifest are data, not code (keep the dir, ignore contents)
 data/clips/*.json
 data/manifest.jsonl
+# ... except the attested calibration corpus. tests/test_seated.py gates on
+# these per frame, so a fresh checkout that lacks them cannot run the gate.
+!data/clips/sitting_1785074559.json
+!data/clips/sitting_1784950347.json
+!data/clips/standing_1784950390.json
+!data/clips/walking_1784952866.json
 .harness/

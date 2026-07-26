@@ -1,42 +1,48 @@
-"""Ground-truth state classifier for the bathroom matrix lidar.
+"""Per-frame features for the bathroom matrix lidar, and the state seam.
 
-Turns an oriented 8x8 frame into one of the labeled states (zones.State)
-deterministically and explainably, so it can serve as ground truth for
-recorded clips.
-
-How it decides
---------------
-Distances are mm; smaller = closer. The sensor sits between the user and the
+Distances are mm; smaller = closer. The sensor looks across the room at the
 toilet, so a body reads CLOSER than the empty-room baseline at whatever it
-occludes. We measure occlusion as a per-cell *depression* below a captured
+occludes. Occlusion is measured as a per-cell *depression* below a captured
 empty baseline (the field is a non-uniform bowl, so absolute thresholds are
 wrong). The DOOR column (H) is excluded from presence: it swings 1000->4000mm
 on its own and says nothing about a body.
 
-Discriminators, calibrated on the four labeled captures AND hardened against
-the boundary failures an adversarial review surfaced (see tests/):
-  EMPTY   almost no occluded cells, OR a tiny co-located noise cluster.
-  WALKING a body filling the near field in front of the sensor: many very-near
-          cells, OR near cells spanning >=4 columns (so it is robust to the
-          exact VNEAR cutoff: a body at ~650mm across the width still reads
-          WALKING instead of flipping to STANDING).
-  STANDING upright body -> it occludes the HEADROOM (top row) DEEPLY
-          (>= DEEP_DELTA below baseline). One deep headroom cell over a real
-          body footprint is enough, so a narrow/off-center stance is not
-          misread as sitting. Row 1 only: a seated body leaning forward
-          reaches row 2, so row 2 must not count as standing.
-  SITTING low/seated body -> headroom stays at baseline (no deep top-row
-          occlusion) while occluded cells cluster low. The toilet zone alone
-          is NOT sufficient (door swing / dust would otherwise read SITTING).
-  UNKNOWN a body is present but matches no posture cleanly. Returned instead of
-          a confident wrong label, so auto-labels stay trustworthy as ground
-          truth.
+Two things live here now
+------------------------
+FEATURES (`features`) are still this module's, and are still what occupancy.py,
+the sparklines and the recorded clips consume. Unchanged.
+
+THE STATE comes from `bathroom.posture3d`, which unprojects the frame into
+metric 3D and asks where the body is relative to the toilet reconstructed from
+the empty-room scan. `classify` merges posture3d's metric features in and
+reports the old verdict alongside as `row_band_state`.
+
+Why the decision moved out
+--------------------------
+Everything in `Params` that decided POSTURE was a row band: HEAD_ROWS,
+UPPER_ROWS, LOWER_ROWS, TORSO_ROWS. A row is an ANGLE, not a height: a return's
+height is range*tan(angle), so the row a shoulder lands in moves with distance,
+and retuning a band only changes which distance it is right at.
+
+The specific failure that forced this: SITTING required the toilet's own cells
+to read DELTA_MM (300mm) nearer than the empty room. A body sitting on the seat
+is within a body thickness of the seat surface, so it never can. In the four
+operator-narrated sitting frames of the 2026-07-26 09:00 session those cells
+moved 0-299mm and `lower_at_fixture` scored 0 in every one; the state came out
+UNKNOWN for 146 consecutive seconds of an attested sit. Across the whole
+labeled corpus the row-band rule recovered 162 of 323 attested sitting frames
+and sent 153 of them to UNKNOWN; posture3d recovers 300 of 323, with 4 false
+sittings in 436 non-sitting frames.
+
+`row_band_state` is kept, exercised and reported so the two can be compared on
+live data, not because it is a fallback worth trusting for posture.
 
 Tuned constants live in `Params`; calibrate.py sweeps them over the labeled
-corpus. The classifier is pure (no I/O).
+corpus. This module is pure (no I/O).
 """
 import statistics
 
+from . import posture3d, roomscan
 from .zones import N, NO_TARGET, DOOR_COL, ZONE_CELLS, Zone, State
 
 
@@ -205,43 +211,58 @@ def features(matrix, baseline=None):
     }
 
 
-def classify(matrix, baseline=None):
-    """Map an oriented (denoised) frame to a (State, features) pair.
+def row_band_state(f):
+    """The row-band decision this module used to be. KEPT FOR COMPARISON ONLY.
 
-    Order matters: EMPTY/noise and WALKING are resolved before the posture
-    split, because a body up close also occludes the upper field. A present-
-    but-unclassifiable body returns UNKNOWN rather than a confident guess.
+    It cannot detect sitting, for a reason that is not a threshold: it asks
+    whether the seat's own cells read DELTA_MM nearer than the empty room, and
+    a body sitting on the seat is within a body thickness of the seat surface,
+    so it never can. In the four operator-narrated sitting frames of the 09:00
+    session the seat cells moved 0-299mm against a 300mm cut and
+    `lower_at_fixture` scored 0 every time; the state came out UNKNOWN for 146
+    consecutive seconds of an attested sit. posture3d.classify replaces it and
+    records the rest of the dead hypotheses.
     """
-    f = features(matrix, baseline)
     min_mm = f["min_mm"] if f["min_mm"] is not None else NO_TARGET
-
     if f["occ_count"] <= Params.EMPTY_MAX or f["noise_cluster"]:
-        return State.EMPTY, f
-    # WALKING: a body filling the near field in front of the sensor.
+        return State.EMPTY
     if f["vnear_count"] >= Params.VNEAR_MIN:
-        return State.WALKING, f
+        return State.WALKING
     if (f["near_cols"] >= Params.NEAR_COLS_MIN
             and f["near_count"] >= Params.NEAR_MIN
             and min_mm < Params.NEAR_SOFT + 100):
-        return State.WALKING, f
-    # below WALKING but too little structure to call a posture
+        return State.WALKING
     if f["occ_count"] < Params.MIN_BODY:
-        return State.UNKNOWN, f
-    # STANDING: upright body occludes the headroom DEEPLY with a torso below,
-    # OR (depth path) the body plane itself reaches the upper FOV: two or more
-    # upper-region cells at the body's own depth. The depth path catches a
-    # standing body ~1m out whose absolute depression is too shallow for
-    # DEEP_DELTA (the mirror-use misdetection).
+        return State.UNKNOWN
     if (f["deep_upper_supported"] >= Params.DEEP_UPPER_MIN
             or f["upper_body"] >= Params.UPPER_BODY_MIN):
-        return State.STANDING_AT_TOILET, f
-    # SITTING is positional AND depth-consistent: bottom occupied, the lower
-    # cluster overlaps the toilet fixture, the body reads at the SEAT's depth
-    # (a floor-stander beside the fixture is systematically closer), and the
-    # headroom is clear (no supported deep top cell; at most a leaning head
-    # at body depth). "Any body with headroom" is no longer sitting.
+        return State.STANDING_AT_TOILET
     if (f["lower_count"] >= Params.LOWER_MIN and f["deep_upper_supported"] == 0
             and f["upper_body"] <= 1 and f["lower_at_fixture"] >= 1
             and f["body_at_seat"]):
-        return State.SITTING_AT_TOILET, f
-    return State.UNKNOWN, f
+        return State.SITTING_AT_TOILET
+    return State.UNKNOWN
+
+
+def classify(matrix, baseline=None):
+    """Map an oriented frame to a (State, features) pair.
+
+    The STATE comes from bathroom.posture3d, which unprojects the frame into
+    metric 3D and asks where the body is relative to the reconstructed toilet.
+    The FEATURES are still this module's, because occupancy.py and the
+    sparklines consume them; posture3d's metric features are merged in under
+    their own keys, and `row_band_state` is reported alongside so the two
+    decisions can be compared on live data.
+    """
+    base = baseline or DEFAULT_BASELINE
+    f = features(matrix, base)
+    f["row_band_state"] = row_band_state(f).name
+    try:
+        state, f3d = posture3d.classify(matrix, base)
+    except roomscan.SceneError as e:
+        # a baseline the metric model cannot read is a real fault, but it must
+        # not take the room engine down with it: fall back, and say so.
+        f["scene_error"] = str(e)
+        return row_band_state(f), f
+    f.update(f3d)
+    return state, f

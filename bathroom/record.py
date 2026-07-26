@@ -20,6 +20,7 @@ import os
 import sys
 import time
 
+from . import classify
 from . import config
 from . import detect
 from . import stream
@@ -94,6 +95,18 @@ def _waiting(attempt, total):
 def record_clip(label, seconds, notes=None):
     config.ensure_dirs()
     baseline = config.load_baseline()
+    # A clip stores the baseline it was captured against, and downstream that
+    # field is taken as the scene. If load_baseline() silently fell back to the
+    # built-in default, the clip would claim a scene it was NOT captured in:
+    # three clips in this corpus did exactly that (their own background agrees
+    # with the real scan to 32mm and with DEFAULT_BASELINE only to 102mm, up to
+    # 514mm at the toilet) and had to be repaired by hand afterwards. Refuse.
+    if baseline is classify.DEFAULT_BASELINE:
+        sys.stderr.write(
+            "refusing to record: no empty-room baseline at %s, and the "
+            "built-in default describes a different scene. Capture one first:\n"
+            "  python3 -m bathroom.record --baseline\n" % config.BASELINE_FILE)
+        return 1
     eng = StateEngine(baseline=baseline)
     frames = []
 
