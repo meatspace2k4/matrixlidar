@@ -12,9 +12,10 @@ Two things live here now
 FEATURES (`features`) are still this module's, and are still what occupancy.py,
 the sparklines and the recorded clips consume. Unchanged.
 
-THE STATE comes from `bathroom.posture3d`, which unprojects the frame into
-metric 3D and asks where the body is relative to the toilet reconstructed from
-the empty-room scan. `classify` merges posture3d's metric features in and
+THE STATE comes from `bathroom.posture`, which reads the body as a SHAPE in the
+picture: cells nearer than the empty room plus cells where nothing came back at
+all, taken as one connected run, then placed by whether it reaches the top row
+and whether it sits over the toilet. `classify` merges its features in and
 reports the old verdict alongside as `row_band_state`.
 
 Why the decision moved out
@@ -31,8 +32,7 @@ operator-narrated sitting frames of the 2026-07-26 09:00 session those cells
 moved 0-299mm and `lower_at_fixture` scored 0 in every one; the state came out
 UNKNOWN for 146 consecutive seconds of an attested sit. Across the whole
 labeled corpus the row-band rule recovered 162 of 323 attested sitting frames
-and sent 153 of them to UNKNOWN; posture3d recovers 300 of 323, with 4 false
-sittings in 436 non-sitting frames.
+and sent 153 of them to UNKNOWN. bathroom.posture recovers 316 of 323.
 
 `row_band_state` is kept, exercised and reported so the two can be compared on
 live data, not because it is a fallback worth trusting for posture.
@@ -42,7 +42,7 @@ corpus. This module is pure (no I/O).
 """
 import statistics
 
-from . import posture3d
+from . import posture
 from .zones import N, NO_TARGET, DOOR_COL, ZONE_CELLS, Zone, State
 
 
@@ -232,8 +232,7 @@ def row_band_state(f):
     so it never can. In the four operator-narrated sitting frames of the 09:00
     session the seat cells moved 0-299mm against a 300mm cut and
     `lower_at_fixture` scored 0 every time; the state came out UNKNOWN for 146
-    consecutive seconds of an attested sit. posture3d.classify replaces it and
-    records the rest of the dead hypotheses.
+    consecutive seconds of an attested sit. posture.classify replaces it.
     """
     min_mm = f["min_mm"] if f["min_mm"] is not None else NO_TARGET
     if f["occ_count"] <= Params.EMPTY_MAX or f["noise_cluster"]:
@@ -259,23 +258,14 @@ def row_band_state(f):
 def classify(matrix, baseline):
     """Map an oriented frame to a (State, features) pair.
 
-    The STATE comes from bathroom.posture3d, which unprojects the frame into
-    metric 3D and asks where the body is relative to the reconstructed toilet.
-    The FEATURES are still this module's, because occupancy.py and the
-    sparklines consume them; posture3d's metric features are merged in under
-    their own keys, and `row_band_state` is reported alongside so the two
-    decisions can be compared on live data.
+    The STATE comes from bathroom.posture. The FEATURES are still this
+    module's, because occupancy.py and the sparklines consume them; posture's
+    shape features are merged in under their own keys, and `row_band_state` is
+    reported alongside so the two decisions can be compared on live data.
     """
     base = baseline
     f = features(matrix, base)
     f["row_band_state"] = row_band_state(f).name
-    # roomscan.SceneError is NOT caught here. An earlier revision of this
-    # function caught it and returned row_band_state(f) instead, which silently
-    # degrades to the classifier this whole change exists because it cannot
-    # detect sitting: the operator would watch STATE: UNKNOWN through another
-    # sit with nothing on screen to say why. A baseline the metric model cannot
-    # read is a fault to fix, and posture3d.preflight() exists so it surfaces at
-    # startup rather than on frame 1.
-    state, f3d = posture3d.classify(matrix, base)
-    f.update(f3d)
+    state, shape = posture.classify(matrix, base)
+    f.update(shape)
     return state, f

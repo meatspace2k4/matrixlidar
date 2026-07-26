@@ -45,7 +45,7 @@ def load_baseline(path=None):
     existed (wrong by up to 514mm on the toilet's own cells); measured against
     those, surface rake looked like a 94%-decisive posture feature and a whole
     classifier was built on it, while the feature that actually works looked
-    marginal. See bathroom/posture3d.py. Nothing announced itself: every run
+    marginal. Nothing announced itself: every run
     completed and printed plausible states.
 
     It was also PINNED BY A TEST ("corrupt baseline falls back to default",

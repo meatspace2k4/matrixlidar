@@ -15,7 +15,7 @@ import sys
 import time
 from collections import deque
 
-from . import archive, config, detect, occupancy, posture3d, roomscan, stream, sparkline
+from . import archive, config, detect, occupancy, stream, sparkline
 from .engine import StateEngine
 from .zones import State
 
@@ -46,14 +46,12 @@ def main():
 
     try:
         baseline = config.load_baseline()
-        # build the metric scene up front too, so a baseline the 3D model
-        # cannot read surfaces here and not on frame 1
-        sys.stderr.write("%s\n" % posture3d.preflight(baseline))
-    except (config.BaselineError, roomscan.SceneError) as e:
+    except config.BaselineError as e:
         sys.stderr.write("%s\n" % e)
         return 1
     eng = StateEngine(baseline=baseline, commit_after=args.commit_after)
     room_eng = occupancy.OccupancyEngine(baseline=baseline)
+    door = detect.DoorReading(baseline)
     marker = archive.Marker()
     occ_hist = deque(maxlen=HIST)
     state_hist = deque(maxlen=HIST)
@@ -64,8 +62,8 @@ def main():
             now = time.time()
             t0 = t0 if t0 is not None else now
             u = eng.update(m, now - t0)
-            door = detect.door_open_pct(m)
-            ru = room_eng.update(m, now - t0, door_pct=door)
+            door_pct = door.update(m)
+            ru = room_eng.update(m, now - t0, door_pct=door_pct)
             marker.update(u, ru, now - t0)
             occ_hist.append(u.features["occ_count"])
             state_hist.append(u.committed)
@@ -95,8 +93,10 @@ def main():
                                       occupancy.fmt_duration((now - t0) - ru.since))
             if ru.event == "OCCLUDED":
                 shown = "VIEW BLOCKED"
-            lead = "%-20s %-21s inst=%-18s door=%3.0f%% " % (
-                room_txt, shown, u.instant.name, door)
+            door_txt = ("  --" if door.pct is None
+                        else "%3.0f%%%s" % (door.pct, "" if door.coherent else "*"))
+            lead = "%-20s %-21s inst=%-18s door=%-5s " % (
+                room_txt, shown, u.instant.name, door_txt)
             # fit the line to the terminal: a wrapped line cannot be
             # rewritten with \r and scrolls a new row per frame instead
             cols = shutil.get_terminal_size(fallback=(120, 24)).columns

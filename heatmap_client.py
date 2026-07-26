@@ -14,7 +14,7 @@ import sys
 import time
 from collections import deque
 
-from bathroom import archive, config, detect, occupancy, posture3d, roomscan, sparkline, stream
+from bathroom import archive, config, detect, occupancy, sparkline, stream
 from bathroom.engine import StateEngine
 from bathroom.live import DRIFT_FRAMES, _direction
 from bathroom.zones import N, NO_TARGET, State, Zone
@@ -57,7 +57,7 @@ _hold = [[NO_TARGET] * N for _ in range(N)]       # last real value (display onl
 _stale = [[HOLD_FRAMES + 1] * N for _ in range(N)]  # frames since that value
 
 
-def render(m, state_name, room_txt, occ_hist, state_hist):
+def render(m, state_name, room_txt, occ_hist, state_hist, door):
     out = ["\x1b[H", "\x1b[1m DFRobot Matrix Lidar  8x8 heatmap (cm)\x1b[0m\x1b[K\n\n"]
     for r in range(N):
         line = []
@@ -83,9 +83,17 @@ def render(m, state_name, room_txt, occ_hist, state_hist):
     out.append(" far/none\x1b[K\n\x1b[K\n")
     for z in (Zone.TOTO, Zone.DOOR, Zone.FRAME):
         v = detect.zone_values(m, z)
-        extra = "  open=%.0f%%" % detect.door_open_pct(m) if z == Zone.DOOR else ""
-        out.append("  %d %-9s %4d cm%s\x1b[K\n"
-                   % (int(z), z.name, (v["median"] + 5) // 10, extra))
+        extra = ""
+        if z == Zone.DOOR:
+            # the panel's rotation off the jamb plane, not a column median. A
+            # held (stale) reading is starred: a body in the doorway splits the
+            # column and no plane describes it.
+            extra = ("  open=  --" if door.pct is None else
+                     "  open=%3.0f%%%s" % (door.pct, "" if door.coherent else "*"))
+        cm = ("  -- " if v["median"] is None
+              else "%4d" % ((v["median"] + 5) // 10))
+        out.append("  %d %-9s %s cm  %d/%d rays%s\x1b[K\n"
+                   % (int(z), z.name, cm, v["returns"], v["rays"], extra))
     out.append("\x1b[K\n \x1b[1mSTATE: %-22s\x1b[0m\x1b[K\n" % state_name)
     out.append(" \x1b[1mROOM:  %-26s\x1b[0m\x1b[K\n" % room_txt)
     hi = max(8, max(occ_hist) if occ_hist else 8)
@@ -104,14 +112,12 @@ def _waiting(attempt, total):
 def main():
     try:
         baseline = config.load_baseline()
-        # build the metric scene up front too, so a baseline the 3D model
-        # cannot read surfaces here and not on frame 1
-        sys.stderr.write("%s\n" % posture3d.preflight(baseline))
-    except (config.BaselineError, roomscan.SceneError) as e:
+    except config.BaselineError as e:
         sys.stderr.write("%s\n" % e)
         return 1
     eng = StateEngine(baseline=baseline)
     room_eng = occupancy.OccupancyEngine(baseline=baseline)
+    door = detect.DoorReading(baseline)
     marker = archive.Marker()
     occ_hist = deque(maxlen=HIST)
     state_hist = deque(maxlen=HIST)
@@ -128,7 +134,7 @@ def main():
             t0 = t0 if t0 is not None else now
             u = eng.update(m, now - t0)
             ru = room_eng.update(m, now - t0,
-                                 door_pct=detect.door_open_pct(m))
+                                 door_pct=door.update(m))
             marker.update(u, ru, now - t0)
             occ_hist.append(u.features["occ_count"])
             state_hist.append(u.committed)
@@ -144,7 +150,7 @@ def main():
                 shown += _direction(col_hist)   # '<-' left / '->' right
             room_txt = "%s(%d) %s" % (ru.room, ru.occupants,
                                       occupancy.fmt_duration((now - t0) - ru.since))
-            render(m, shown, room_txt, occ_hist, state_hist)
+            render(m, shown, room_txt, occ_hist, state_hist, door)
     except (KeyboardInterrupt, ConnectionError):
         pass
     finally:
