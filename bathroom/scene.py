@@ -211,10 +211,19 @@ def read_frame(matrix, baseline):
     for r in range(N):
         for c in range(N):
             v = matrix[r][c]
+            b = base[r][c]
             if v >= NO_TARGET:
                 no_target += 1
+                # The beam went out where the scan found a surface and nothing
+                # came back: mass in the way. A SEATED body is mostly this, so
+                # counting only cells that read 300mm nearer made interior_body
+                # go False the moment the operator sat down, and the room then
+                # resolved an open transit as an EXIT with someone on the
+                # toilet (measured: EXIT 11.6s into an attested sit). The door
+                # column is excluded, as everywhere else: it swings on its own.
+                if b < NO_TARGET and c not in Params.DOORWAY_COLS:
+                    interior.append((label(r, c), v))
                 continue
-            b = base[r][c]
             if b >= NO_TARGET:
                 # the scan found no surface on this ray, so "300mm closer than
                 # the empty room" and "40-95% of the way to it" are both
@@ -300,6 +309,7 @@ class SceneAutomaton:
         self.occupied = False
         self.first_interior_t = None
         self.first_doorway_t = None
+        self._interior_at_open = False
         self._occluded_run = 0   # consecutive blocked frames
         self._occluded_reported = False
 
@@ -338,41 +348,50 @@ class SceneAutomaton:
             if self.first_doorway_t is None:
                 self.first_doorway_t = t
             self.pending = t
+            # which side the body was on when the transit opened
+            self._interior_at_open = self.interior.value
             events.append({"t": t, "kind": "DOORWAY_EVENT",
                            "cells": list(reading.doorway_cells),
                            "panel": reading.door_panel})
 
         if self.pending is not None:
-            # KNOWN DEFECT, diagnosed and deliberately not patched here.
-            # ENTRY and EXIT differ only in ORDER: entering is doorway then
-            # interior, leaving is interior then doorway. This test is
-            # order-blind, and on the way OUT the interior is still True at the
-            # instant the body reaches the doorway (you are inside the room
-            # until you are in the doorway), so a departure resolves as ENTERED
-            # and the exit is lost. Traced on walking_1784952866 at t=16.46:
-            # the debounced doorway rises while interior is still True, ENTERED
-            # fires, occupancy.py discards it via `already_occupied`, and the
-            # room latches OCCUPIED with the bathroom empty.
-            # Requiring the interior to ARRIVE (int_rose) instead is worse, not
-            # better: it was measured, and it turns held occupancy into false
-            # exits (EXIT at 11.3s of an attested sit, 9.5s into an attested
-            # stand). The order has to be read over the whole transit, not from
-            # one frame's edge, and that is a change to this automaton's shape
-            # rather than to this condition.
-            if self.interior.value:
+            # ENTRY and EXIT differ only in ORDER: entering is doorway THEN
+            # interior, leaving is interior THEN doorway. Reading one frame's
+            # edge cannot tell them apart, because on the way OUT the interior
+            # is still True at the instant the body reaches the doorway (you
+            # are inside the room until you are in the doorway). So the transit
+            # is resolved against what the interior was WHEN IT OPENED:
+            #
+            #   opened with the interior clear -> the body came from the
+            #     doorway. It is an entry once the interior fills.
+            #   opened with the interior set   -> the body came from inside.
+            #     It is an exit once BOTH clear.
+            #
+            # EXITED must test the interior itself, not rely on reaching an
+            # elif. An earlier attempt at this ordering left the exit branch as
+            # `elif not self.door.value`, which then fired whenever the doorway
+            # blipped during a sit and the interior was still plainly occupied:
+            # EXIT 11.3s into an attested sit, 9.5s into an attested stand.
+            if self.interior.value and not self._interior_at_open:
                 events.append({"t": t, "kind": "ENTERED",
                                "already_occupied": self.occupied,
                                "since_event": t - self.pending})
                 self.occupied = True
                 self.pending = None
-            elif not self.door.value:
+            elif not self.interior.value and not self.door.value:
                 events.append({"t": t, "kind": "EXITED",
                                "was_occupied": self.occupied,
                                "since_event": t - self.pending,
                                "panel": reading.door_panel})
                 self.occupied = False
                 self.pending = None
-        elif int_rose and not self.occupied:
+        # PRESENCE_NO_ENTRY is reported on ANY interior rise while the room is
+        # not known-occupied, including while a transit is open. It used to be
+        # an `elif` on the pending block, so a transit that opened with the
+        # interior already set (a capture that starts mid-posture, or a doorway
+        # blip) swallowed it and the room reported nothing at all while a body
+        # stood in plain view.
+        if int_rose and not self.occupied:
             events.append({"t": t, "kind": "PRESENCE_NO_ENTRY",
                            "cells": list(reading.interior_cells),
                            "panel": reading.door_panel})
