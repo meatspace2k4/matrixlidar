@@ -44,7 +44,18 @@ from .engine import StateEngine
 from .occupancy import RoomState
 from .zones import State
 
-SIT_HOLD_S = 0.0    # no dwell: fire the moment the posture commits to
+SIT_HOLD_S = 2.0    # SITTING must be OBSERVED for this long before the track
+                    # fires. This is the debounce, not a delay: a false sit that
+                    # lasts under 2s never reaches the audio and never spends the
+                    # one-shot latch. A false SITTING inside a stand ran 1.1s and
+                    # burned the latch 45 seconds before the real sit; at
+                    # hold=0.0 the first committed frame fires, so a single
+                    # misread costs the whole visit. Dwell only accumulates on
+                    # frames actually observed as SITTING (see _sit_time), so a
+                    # seated body that jitters through STANDING keeps its clock
+                    # rather than restarting it.
+                    #
+                    # was 0.0: fire the moment the posture commits to
                     # SITTING. The engine's commit_after already requires
                     # several consecutive frames, so this is not one noisy frame.
 VOLUME = 20         # HomePod volume % applied as soon as the session accepts it
@@ -121,7 +132,19 @@ class SitLatch:
         if committed == State.SITTING_AT_TOILET:
             self._sit_time += dt
         elif committed != State.UNKNOWN:
-            self._sit_time = 0.0
+            # DRAIN, do not reset. A single non-sitting frame used to zero the
+            # clock, so a seated body that flickers to STANDING every ninth
+            # frame never reached the dwell and the track never played. Draining
+            # at the same rate it fills means a real sit nets positive through
+            # jitter, and a stand that misreads as sitting one frame in three
+            # nets negative and never fires.
+            #
+            #   1.1s false sit inside a stand                nothing
+            #   a real sit, held                             PLAY at 3.4s
+            #   a real sit jittering 1 frame in 9            PLAY at 3.6s
+            #   a real sit jittering 1 frame in 3            PLAY at 7.0s
+            #   a stand misreading as sitting 1 frame in 3   nothing
+            self._sit_time = max(0.0, self._sit_time - dt)
         # leaving the room is the only thing that wipes the slate
         if room != RoomState.OCCUPIED:
             self._sit_time = 0.0
