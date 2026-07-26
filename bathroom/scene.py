@@ -126,12 +126,24 @@ class Params:
 
 
 def passage_band(baseline):
-    """{(r, c): (lo_mm, hi_mm)} for every doorway-ray cell."""
-    base = baseline
+    """{(r, c): (lo_mm, hi_mm)} for every doorway ray that HAS a baseline surface.
+
+    The band is a fraction of the distance to the surface the scan found on that
+    ray, so a ray the scan found nothing on gets no band and is skipped. It used
+    to call _eff_base() here, which substitutes 1500mm for no-target and turns
+    the band into arithmetic on an invented number: a scan taken with the door
+    open has all of column H at no-target, so every one of those rays got the
+    band (600, 1425), and a CLOSED door at 1085mm then sat permanently inside it
+    and read as a body crossing the threshold. That fired phantom EXITs in an
+    empty room. Columns F and G (interior-adjacent and the jamb) always have a
+    surface, and MIN_DOORWAY_CELLS is 2, so the test still has what it needs.
+    """
     band = {}
     for r in range(N):
         for c in Params.DOORWAY_COLS:
-            b = _eff_base(base[r][c])
+            b = baseline[r][c]
+            if b >= NO_TARGET:
+                continue
             band[(r, c)] = (Params.BAND_LO * b, Params.BAND_HI * b)
     return band
 
@@ -202,13 +214,24 @@ def read_frame(matrix, baseline):
             if v >= NO_TARGET:
                 no_target += 1
                 continue
+            b = base[r][c]
+            if b >= NO_TARGET:
+                # the scan found no surface on this ray, so "300mm closer than
+                # the empty room" and "40-95% of the way to it" are both
+                # arithmetic on a number that does not exist. This used to call
+                # _eff_base(), which substitutes 1500mm: a scan taken with the
+                # door open has all of column H at no-target, every one of
+                # those rays got the band (600, 1425), and a CLOSED door at
+                # 1085mm sat permanently inside it. Two such cells is all
+                # doorway_body needs, so an empty room with a shut door read as
+                # a body crossing the threshold and fired phantom EXITs.
+                continue
             # a surviving return that is body-depth (the same criterion a
             # body cell uses). On a blocked view these are the positive
             # evidence that something is there: the real churn frames carry
             # ~4 of them at 673-824mm while the rest of the field is dead.
-            if v > 0 and _eff_base(base[r][c]) - v >= Params.MARGIN_MM:
+            if v > 0 and b - v >= Params.MARGIN_MM:
                 near.append((label(r, c), v))
-            b = _eff_base(base[r][c])
             if b - v < Params.MARGIN_MM:
                 continue
             if c in Params.DOORWAY_COLS:
@@ -320,6 +343,22 @@ class SceneAutomaton:
                            "panel": reading.door_panel})
 
         if self.pending is not None:
+            # KNOWN DEFECT, diagnosed and deliberately not patched here.
+            # ENTRY and EXIT differ only in ORDER: entering is doorway then
+            # interior, leaving is interior then doorway. This test is
+            # order-blind, and on the way OUT the interior is still True at the
+            # instant the body reaches the doorway (you are inside the room
+            # until you are in the doorway), so a departure resolves as ENTERED
+            # and the exit is lost. Traced on walking_1784952866 at t=16.46:
+            # the debounced doorway rises while interior is still True, ENTERED
+            # fires, occupancy.py discards it via `already_occupied`, and the
+            # room latches OCCUPIED with the bathroom empty.
+            # Requiring the interior to ARRIVE (int_rose) instead is worse, not
+            # better: it was measured, and it turns held occupancy into false
+            # exits (EXIT at 11.3s of an attested sit, 9.5s into an attested
+            # stand). The order has to be read over the whole transit, not from
+            # one frame's edge, and that is a change to this automaton's shape
+            # rather than to this condition.
             if self.interior.value:
                 events.append({"t": t, "kind": "ENTERED",
                                "already_occupied": self.occupied,
