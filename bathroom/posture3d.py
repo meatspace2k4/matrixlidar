@@ -13,8 +13,10 @@ Take the largest connected run of those cells (one body, not scattered cells),
 then answer the three questions you answer by looking at the grid:
 
   is there a shape at all           no -> EMPTY
-  does it reach the top row         no -> the body is low. Over the toilet
-                                          columns, that is SITTING.
+  does it reach the top row         no -> the body is low. Then ask the SEAT,
+                                          against its own baseline: if the
+                                          fixture's cells have come forward, the
+                                          body is on it. SITTING.
   it reaches the top, how near      at the lens -> crossing in front of it,
                                           WALKING. Further -> STANDING at the
                                           toilet.
@@ -39,14 +41,28 @@ LENS_MM = 680       # an upright shape this near is crossing in front of the
                     # lens, not standing at the toilet. Attested: walking reads
                     # 290-776mm (median 612), standing 680-903 (median 760).
 TOP_ROW = 0
-BEHIND_SEAT_MM = 250  # a body ON the seat cannot read further away than the
-                      # seat plus a body's depth. The scan says where the seat
-                      # is (median of the toilet's own cells), so this is a
-                      # margin, not a distance. Attested sitting runs 691-1179mm
-                      # against a seat at 1029mm; the frames this rejects sat at
-                      # 1436-1454mm, i.e. 400mm BEHIND the toilet, and were
-                      # far-field dropouts that happened to fall over its
-                      # columns.
+# THE SEAT, MEASURED AGAINST ITSELF.
+#
+# The seat cells are the only cells whose baseline is a NEAR FIXTURE rather than
+# a far wall, so a flat depression threshold cannot read them. NEAR_MM is 250 on
+# a ~1500mm wall, which is 17%. Seventeen percent of the seat's own ~1000mm
+# baseline is ~200mm, and ~200mm is exactly the standoff a body sitting on the
+# seat has. That is why "a person-shaped thing 300mm in front of the seat" was
+# undetectable: the number was scaled to the wall and applied to the fixture.
+#
+# Proportional to each cell's own baseline instead. Measured over 759 attested
+# frames, cells of 6 advanced past 20% of their own baseline:
+#
+#     sitting    1-5, median 2      >= 1 in ALL 323 frames
+#     standing   0-2, median 1
+#     walking    0-6, median 1
+#     empty      0 in ALL 161 frames
+#
+# So >= 1 is a necessary condition for sitting with no false negatives and no
+# empty-room noise. It replaces three separate tests (toilet-column overlap,
+# body distance, and a margin behind the seat) that together scored the same.
+SEAT_ADVANCE_FRAC = 0.20
+SEAT_ADVANCE_MIN = 1
 BLOCKED_FRACTION = 0.5  # more than half the rays THE SCAN ANSWERS coming back
                         # dead is not a body, it is something over the sensor.
                         # The largest attested body leaves 12 rays dead; a
@@ -107,6 +123,19 @@ def seat_mm(baseline):
     return int(statistics.median(v)) if v else None
 
 
+def seat_advance(matrix, baseline):
+    """Toilet cells whose return has come forward of the FIXTURE'S OWN baseline
+    by a fixture-scale amount. This is the seat measured against itself."""
+    n = 0
+    for (r, c) in ZONE_CELLS[Zone.TOTO]:
+        b = baseline[r][c]
+        if b >= NO_TARGET or matrix[r][c] >= NO_TARGET:
+            continue
+        if b - matrix[r][c] >= SEAT_ADVANCE_FRAC * b:
+            n += 1
+    return n
+
+
 def features(matrix, baseline):
     """What the shape is and where it sits. Plain dict, logged next to the state."""
     near, gone = cells(matrix, baseline)
@@ -122,6 +151,7 @@ def features(matrix, baseline):
         "blocked": bool(answerable) and dead > BLOCKED_FRACTION * answerable,
         "dead_rays": dead,
         "seat_mm": seat_mm(baseline),
+        "seat_advance": seat_advance(matrix, baseline),
         "body_cells": len(shape),
         "returned": len(near),
         "no_return": len(shape) - len(near),
@@ -162,10 +192,9 @@ def classify(matrix, baseline):
         return State.EMPTY, f
 
     if not f["touches_top"]:
-        # the shape does not reach the top of the frame: the body is low
-        if (f["over_toilet"] and f["body_mm"] is not None
-                and f["seat_mm"] is not None
-                and f["body_mm"] <= f["seat_mm"] + BEHIND_SEAT_MM):
+        # The shape does not reach the top of the frame, so the body is low. Is
+        # it on the seat? Ask the seat, against its own baseline.
+        if f["seat_advance"] >= SEAT_ADVANCE_MIN:
             return State.SITTING_AT_TOILET, f
         return State.UNKNOWN, f
 
@@ -180,7 +209,7 @@ def explain(f):
         return "no body"
     if f.get("blocked"):
         return "view blocked (%d dead rays)" % f["dead_rays"]
-    return ("%d cells (%d returned, %d no-return) rows %d-%d top=%s toilet=%s "
+    return ("%d cells (%d returned, %d no-return) rows %d-%d top=%s seat=%d/6 "
             "body=%smm" % (f["body_cells"], f["returned"], f["no_return"],
                            f["rows"][0] + 1, f["rows"][-1] + 1,
-                           f["touches_top"], f["over_toilet"], f["body_mm"]))
+                           f["touches_top"], f["seat_advance"], f["body_mm"]))
