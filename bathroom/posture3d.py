@@ -136,6 +136,17 @@ def features(matrix, baseline):
     }
 
 
+def preflight(baseline):
+    """Startup line for the washlet daemon, which logs this before its frame
+    loop so a bad scan surfaces at START rather than on frame 1. There is no
+    scene to reconstruct here, so what it reports is the fixture this
+    classifier keys off, read out of the scan."""
+    return ("toilet at %smm, columns %s; %d rays answered by the scan"
+            % (seat_mm(baseline), sorted(TOILET_COLS),
+               sum(1 for r in range(N) for c in range(N)
+                   if c != DOOR_COL and baseline[r][c] < NO_TARGET)))
+
+
 def classify(matrix, baseline):
     """One oriented frame -> (State, features)."""
     f = features(matrix, baseline)
