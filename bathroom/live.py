@@ -2,7 +2,6 @@
 rolling occupancy sparkline and a colored state strip.
 
   python3 -m bathroom.live              # one rewriting status line + a sparkline
-  python3 -m bathroom.live --verbose    # also log each committed transition
 
 State transitions are logged to scrollback as they commit; the bottom line
 rewrites in place with the current state (plus a <- / -> direction arrow while
@@ -15,8 +14,7 @@ import sys
 import time
 from collections import deque
 
-from . import config, detect, occupancy, stream, sparkline
-from .classify import features
+from . import occupancy, stream, sparkline
 from .zones import State
 
 HIST = 32  # columns of rolling history in the sparkline + state strip
@@ -38,72 +36,48 @@ def _direction(col_hist):
 
 def main():
     ap = argparse.ArgumentParser(description="Live e2e state readout with sparkline")
-    ap.add_argument("--verbose", action="store_true",
-                    help="log the feature vector on each published transition")
-    args = ap.parse_args()
+    ap.parse_args()
 
-    try:
-        baseline = config.load_baseline()
-    except config.BaselineError as e:
-        sys.stderr.write("%s\n" % e)
-        return 1
-    # THE DAEMON DERIVES, THE VIEWER DISPLAYS. Same rule as heatmap_client:
-    # this readout used to run its own StateEngine + OccupancyEngine over the
-    # stream and diverge from the daemon. STATE/ROOM now come from the
-    # daemon's published feed; the per-frame features below are display
-    # telemetry (sparkline, direction arrow), never state.
-    door = detect.DoorReading(baseline)
+    # THE SERVICE DERIVES, THE VIEWER DISPLAYS. Everything on this line comes
+    # from the published STATE feed; this process runs no engine and reads no
+    # baseline.
     occ_hist = deque(maxlen=HIST)
     state_hist = deque(maxlen=HIST)
-    col_hist = deque(maxlen=DRIFT_FRAMES)
     last_shown = None   # (posture, room) last logged to scrollback
-    room_shown = None
-    room_since = None
+    door_held = None
+    seen_ts = None      # last STATE arrival consumed into the histories
     try:
         for m in stream.frames(on_wait=_waiting):
-            now = time.time()
-            f = features(m, baseline)
-            door.update(m)
-            occ_hist.append(f["occ_count"])
-            cells = f["occ_cells"]
-            if cells:
-                col_hist.append(sum(c for _r, c in cells) / float(len(cells)))
-            else:
-                col_hist.clear()
-
             st = stream.state()
             if st is None:
-                posture, room, occupants = "UNKNOWN", None, 0
                 shown = "NO STATE FEED"
-                room_txt = "(daemon not publishing)"
-                state_hist.append(State.UNKNOWN)
+                room_txt = "(service not publishing)"
             else:
                 posture = st.get("posture", "UNKNOWN")
-                room, occupants = st.get("room"), st.get("occupants", 0)
-                state_hist.append(State[posture] if posture in State.__members__
-                                  else State.UNKNOWN)
-                if room != room_shown:
-                    room_shown, room_since = room, now
+                room = st.get("room")
+                if stream.last_state_ts != seen_ts:   # one column per publish
+                    seen_ts = stream.last_state_ts
+                    occ_hist.append(st.get("occ", 0))
+                    state_hist.append(State[posture] if posture in State.__members__
+                                      else State.UNKNOWN)
                 if (posture, room) != last_shown:
                     if last_shown is not None:
                         sys.stdout.write("\r\x1b[K%s  %-18s room=%-9s%s\n"
                                          % (time.strftime("%H:%M:%S"), posture,
                                             room, (" (%s)" % st["event"])
                                             if st.get("event") else ""))
-                        if args.verbose:
-                            sys.stdout.write("           occ=%d vnear=%d up=%d low=%d toto=%d min=%s\n"
-                                             % (f["occ_count"], f["vnear_count"], f["upper_count"],
-                                                f["lower_count"], int(f["toto_occluded"]), f["min_mm"]))
                     last_shown = (posture, room)
                 shown = posture
-                if st.get("event") == "OCCLUDED":
+                if st.get("blocked"):
                     shown = "VIEW BLOCKED"
-                elif posture == State.WALKING.name:
-                    shown += _direction(col_hist)   # '<-' left / '->' right
-                room_txt = "%s(%d) %s" % (room, occupants,
-                                          occupancy.fmt_duration(now - room_since))
-            door_txt = ("  --" if door.pct is None
-                        else "%3.0f%%%s" % (door.pct, "" if door.coherent else "*"))
+                elif st.get("dir"):
+                    shown += " " + st["dir"]        # '<-' left / '->' right
+                room_txt = "%s(%d) %s" % (
+                    room, st.get("occupants", 0),
+                    occupancy.fmt_duration(st.get("t", 0) - st.get("since", 0)))
+                if st.get("door") is not None:
+                    door_held = st["door"]
+            door_txt = "  --" if door_held is None else "%3.0f%%" % door_held
             lead = "%-20s %-21s door=%-5s " % (room_txt, shown, door_txt)
             # fit the line to the terminal: a wrapped line cannot be
             # rewritten with \r and scrolls a new row per frame instead
@@ -112,7 +86,7 @@ def main():
                 lead = lead[:max(0, cols - 1)]  # plain text, safe to slice
             avail = cols - len(lead) - 1
             spark = strip = ""
-            if avail >= 12:
+            if avail >= 12 and occ_hist:
                 spark_w = min(HIST, max(8, (avail - 3) // 2))
                 strip_w = min(HIST, avail - spark_w - 3)
                 spark = "|%s|" % sparkline.sparkline(

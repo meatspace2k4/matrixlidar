@@ -14,9 +14,7 @@ import sys
 import time
 from collections import deque
 
-from bathroom import config, detect, occupancy, sparkline, stream
-from bathroom.classify import features
-from bathroom.live import DRIFT_FRAMES, _direction
+from bathroom import detect, occupancy, sparkline, stream
 from bathroom.zones import N, NO_TARGET, State, Zone
 
 NEAR_MM = 100
@@ -58,7 +56,7 @@ _stale = [[HOLD_FRAMES + 1] * N for _ in range(N)]  # frames since that value
 _zone_hold = {}  # last real zone median / door pct (display only, starred when held)
 
 
-def render(m, state_name, room_txt, occ_hist, state_hist, door):
+def render(m, state_name, room_txt, occ_hist, state_hist, door_pct):
     out = ["\x1b[H", "\x1b[1m DFRobot Matrix Lidar  8x8 heatmap (cm)\x1b[0m\x1b[K\n\n"]
     for r in range(N):
         line = []
@@ -92,12 +90,10 @@ def render(m, state_name, room_txt, occ_hist, state_hist, door):
         cm = " -- " if mm is None else "%4d" % ((mm + 5) // 10)
         extra = ""
         if z == Zone.DOOR:
-            # the panel's rotation off the jamb plane, not a column median. A
-            # held (stale) reading is starred: a body in the doorway splits the
-            # column and no plane describes it.
-            if door.pct is not None:
-                _zone_hold["door_pct"] = door.pct
-            pct = door.pct if door.pct is not None else _zone_hold.get("door_pct")
+            # the service's published door reading, not anything derived here
+            if door_pct is not None:
+                _zone_hold["door_pct"] = door_pct
+            pct = _zone_hold.get("door_pct")
             extra = ("  open=  --" if pct is None else "  open=%3.0f%%" % pct)
         out.append("  %d %-9s %s cm  %d/%d rays%s\x1b[K\n"
                    % (int(z), z.name, cm, v["returns"], v["rays"], extra))
@@ -117,59 +113,42 @@ def _waiting(attempt, total):
 
 
 def main():
-    try:
-        baseline = config.load_baseline()
-    except config.BaselineError as e:
-        sys.stderr.write("%s\n" % e)
-        return 1
-    # THE DAEMON DERIVES, THE VIEWER DISPLAYS. No StateEngine, no
-    # OccupancyEngine here: this viewer ran its own copies of both over the
-    # same frames as the daemon and they diverged (the daemon logged
-    # ENTRY_CONFIRMED/EXIT while this screen sat on UNKNOWN for 51 minutes).
-    # STATE/ROOM come from the daemon's published feed on the stream; the
-    # per-frame features below are display telemetry (sparkline, direction
-    # arrow), never state.
-    door = detect.DoorReading(baseline)
+    # THE SERVICE DERIVES, THE VIEWER DISPLAYS. Everything on screen except
+    # the raw cells comes from the published STATE feed: posture, room,
+    # duration, door%, occlusion, occ count, walking direction. This process
+    # runs no engine and reads no baseline.
     occ_hist = deque(maxlen=HIST)
     state_hist = deque(maxlen=HIST)
-    col_hist = deque(maxlen=DRIFT_FRAMES)
     started = False
-    room_shown = None   # last room value displayed, for the duration readout
-    room_since = None
+    seen_ts = None      # last STATE arrival consumed into the histories
     try:
         for m in stream.frames(on_wait=_waiting):
             if not started:
                 sys.stderr.write("\r\x1b[K")
                 sys.stdout.write("\x1b[2J\x1b[?25l")  # clear, hide cursor
                 started = True
-            now = time.time()
-            f = features(m, baseline)
-            occ_hist.append(f["occ_count"])
-            cells = f["occ_cells"]
-            if cells:
-                col_hist.append(sum(c for _r, c in cells) / float(len(cells)))
-            else:
-                col_hist.clear()
-            door.update(m)
             st = stream.state()
             if st is None:
                 shown = "NO STATE FEED"
-                room_txt = "(daemon not publishing)"
-                state_hist.append(State.UNKNOWN)
+                room_txt = "(service not publishing)"
+                door_pct = None
             else:
-                posture = st.get("posture", "UNKNOWN")
-                state_hist.append(State[posture] if posture in State.__members__
-                                  else State.UNKNOWN)
-                shown = posture
-                if st.get("event") == "OCCLUDED":
+                if stream.last_state_ts != seen_ts:   # one column per publish
+                    seen_ts = stream.last_state_ts
+                    occ_hist.append(st.get("occ", 0))
+                    posture = st.get("posture", "UNKNOWN")
+                    state_hist.append(State[posture] if posture in State.__members__
+                                      else State.UNKNOWN)
+                shown = st.get("posture", "UNKNOWN")
+                if st.get("blocked"):
                     shown = "VIEW BLOCKED"
-                elif posture == State.WALKING.name:
-                    shown += _direction(col_hist)   # '<-' left / '->' right
-                if st.get("room") != room_shown:
-                    room_shown, room_since = st.get("room"), now
-                room_txt = "%s(%d) %s" % (room_shown, st.get("occupants", 0),
-                                          occupancy.fmt_duration(now - room_since))
-            render(m, shown, room_txt, occ_hist, state_hist, door)
+                elif st.get("dir"):
+                    shown += " " + st["dir"]        # '<-' left / '->' right
+                room_txt = "%s(%d) %s" % (
+                    st.get("room"), st.get("occupants", 0),
+                    occupancy.fmt_duration(st.get("t", 0) - st.get("since", 0)))
+                door_pct = st.get("door")
+            render(m, shown, room_txt, occ_hist, state_hist, door_pct)
     except (KeyboardInterrupt, ConnectionError):
         pass
     finally:

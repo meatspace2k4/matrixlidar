@@ -38,9 +38,12 @@ import sys
 import threading
 import time
 
+from collections import deque
+
 from . import archive, classify, config, detect, occupancy, player as player_mod, posture3d, scene as scene_mod, stream, threshold
 from .donewith import DoneWith, FADE
 from .engine import StateEngine
+from .live import DRIFT_FRAMES, _direction
 from .occupancy import RoomState
 from .zones import State
 
@@ -346,6 +349,12 @@ def main():
     t0 = None
     last_pub = None
     last_pub_t = 0.0
+    # This service derives EVERYTHING the front-ends show. Door reading and
+    # walking direction were still computed by each viewer against its own
+    # local baseline; they are published here now, from the one process that
+    # owns the scene.
+    door = detect.DoorReading(baseline)
+    col_hist = deque(maxlen=DRIFT_FRAMES)
     try:
         for m in stream.frames(host=args.stream_host, port=args.stream_port,
                                on_wait=_waiting):
@@ -354,8 +363,14 @@ def main():
             t = now - t0
             u = eng.update(m, t)
             cross = crossing.update(m, sc, t)
-            ru = room_eng.update(u, t, door_pct=detect.door_open_pct(m),
+            door.update(m)
+            ru = room_eng.update(u, t, door_pct=door.pct,
                                  crossed_out=(cross == threshold.EXIT))
+            cells = u.features["occ_cells"]
+            if cells:
+                col_hist.append(sum(c for _r, c in cells) / float(len(cells)))
+            else:
+                col_hist.clear()
 
             if ru.event is not None:
                 _log("room -> %-9s (%s)" % (ru.room, ru.event))
@@ -375,7 +390,11 @@ def main():
                 stream.send("STATE " + json.dumps(
                     {"posture": u.committed.name, "room": str(ru.room),
                      "occupants": ru.occupants, "t": round(t, 2),
-                     "event": ru.event, "sit_s": round(latch._sit_time, 2)}))
+                     "event": ru.event, "sit_s": round(latch._sit_time, 2),
+                     "since": round(ru.since, 2), "blocked": ru.blocked,
+                     "door": None if door.pct is None else round(door.pct),
+                     "occ": u.features["occ_count"],
+                     "dir": _direction(col_hist).strip()}))
 
             rc = player.reap()
             if rc is not None:

@@ -73,13 +73,14 @@ class Params:
 
 
 class RoomUpdate:
-    __slots__ = ("room", "occupants", "event", "since")
+    __slots__ = ("room", "occupants", "event", "since", "blocked")
 
-    def __init__(self, room, occupants, event, since):
+    def __init__(self, room, occupants, event, since, blocked=False):
         self.room = room            # externally reported RoomState.*
         self.occupants = occupants  # 0 unless OCCUPIED
         self.event = event          # ENTRY_CONFIRMED/EXIT/PRESENCE/GAP_RESET
         self.since = since          # t when the reported room state last changed
+        self.blocked = blocked      # the view is occluded NOW (level, not edge)
 
 
 class OccupancyEngine:
@@ -170,10 +171,12 @@ class OccupancyEngine:
                    and self.baseline[r][c] < NO_TARGET)
         if self._answerable and dead > BLOCKED_FRACTION * self._answerable:
             self._blocked_run += 1
-            if self._blocked_run > SceneParams.DEBOUNCE_N and not self._blocked_said:
+            debounced = self._blocked_run > SceneParams.DEBOUNCE_N
+            if debounced and not self._blocked_said:
                 self._blocked_said = True
                 event = event or "OCCLUDED"
-            return RoomUpdate(self.room, self.occupants, event, self.since)
+            return RoomUpdate(self.room, self.occupants, event, self.since,
+                              blocked=debounced)
         self._blocked_run = 0
         self._blocked_said = False
 
