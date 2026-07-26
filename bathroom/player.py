@@ -26,8 +26,28 @@ that is the cost of using two processes where one session does the job.
 """
 import asyncio
 
-import pyatv
-from pyatv.const import Protocol
+
+def _pyatv():
+    """pyatv, imported on use.
+
+    The washlet unit runs /usr/bin/python3 and pyatv is installed in
+    ~/washlet/venv, so importing it at module scope would crash the daemon on
+    import the moment anything in the package imports this module. Imported here
+    instead, so the failure lands on the caller that actually needs it, with a
+    message naming the interpreter.
+    """
+    try:
+        import pyatv
+        from pyatv.const import Protocol
+        return pyatv, Protocol
+    except ImportError as e:
+        raise PlayError(
+            "pyatv is not importable by this interpreter (%s): %s. The unit's "
+            "ExecStart must be the venv python that has it."
+            % (sys.executable, e))
+
+
+import sys
 
 
 class PlayError(Exception):
@@ -35,6 +55,7 @@ class PlayError(Exception):
 
 
 async def _connect(address, loop, timeout):
+    pyatv, Protocol = _pyatv()
     confs = await pyatv.scan(loop, hosts=[address], timeout=timeout)
     if not confs:
         raise PlayError("no AirPlay device at %s" % address)
@@ -142,3 +163,12 @@ class Playback:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout)
         self._thread = self._loop = self._task = None
+
+
+def available():
+    """Can this interpreter drive the HomePod? No fallback, just the answer."""
+    try:
+        _pyatv()
+        return True
+    except PlayError:
+        return False
