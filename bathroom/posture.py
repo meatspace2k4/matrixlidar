@@ -29,6 +29,8 @@ behind it. That is not smoothed here. engine.StateEngine debounces the label
 (commit_after consecutive frames before the committed state moves), which is
 the layer that owns it.
 """
+import statistics
+
 from .zones import N, NO_TARGET, DOOR_COL, State, ZONE_CELLS, Zone
 
 NEAR_MM = 250       # nearer than the empty room by this much: mass in the way
@@ -37,6 +39,18 @@ LENS_MM = 680       # an upright shape this near is crossing in front of the
                     # lens, not standing at the toilet. Attested: walking reads
                     # 290-776mm (median 612), standing 680-903 (median 760).
 TOP_ROW = 0
+BEHIND_SEAT_MM = 250  # a body ON the seat cannot read further away than the
+                      # seat plus a body's depth. The scan says where the seat
+                      # is (median of the toilet's own cells), so this is a
+                      # margin, not a distance. Attested sitting runs 691-1179mm
+                      # against a seat at 1029mm; the frames this rejects sat at
+                      # 1436-1454mm, i.e. 400mm BEHIND the toilet, and were
+                      # far-field dropouts that happened to fall over its
+                      # columns.
+BLOCKED_FRACTION = 0.5  # more than half the rays THE SCAN ANSWERS coming back
+                        # dead is not a body, it is something over the sensor.
+                        # The largest attested body leaves 12 rays dead; a
+                        # blocked view leaves 24 and up.
 
 # the toilet's own columns, from the zone geometry rather than typed in
 TOILET_COLS = frozenset(c for (_r, c) in ZONE_CELLS[Zone.TOTO])
@@ -86,13 +100,28 @@ def largest_shape(cs):
     return best
 
 
+def seat_mm(baseline):
+    """How far the toilet is, from the scan. Not a typed-in distance."""
+    v = [baseline[r][c] for (r, c) in ZONE_CELLS[Zone.TOTO]
+         if baseline[r][c] < NO_TARGET]
+    return int(statistics.median(v)) if v else None
+
+
 def features(matrix, baseline):
     """What the shape is and where it sits. Plain dict, logged next to the state."""
     near, gone = cells(matrix, baseline)
     shape = largest_shape(set(near) | gone)
     near = {rc: v for rc, v in near.items() if rc in shape}
     dists = sorted(near.values())
+    answerable = sum(1 for r in range(N) for c in range(N)
+                     if c != DOOR_COL and baseline[r][c] < NO_TARGET)
+    dead = sum(1 for r in range(N) for c in range(N)
+               if c != DOOR_COL and matrix[r][c] >= NO_TARGET
+               and baseline[r][c] < NO_TARGET)
     return {
+        "blocked": bool(answerable) and dead > BLOCKED_FRACTION * answerable,
+        "dead_rays": dead,
+        "seat_mm": seat_mm(baseline),
         "body_cells": len(shape),
         "returned": len(near),
         "no_return": len(shape) - len(near),
@@ -111,12 +140,21 @@ def classify(matrix, baseline):
     """One oriented frame -> (State, features)."""
     f = features(matrix, baseline)
 
+    if f["blocked"]:
+        # Something is over the sensor. The empty room answers on essentially
+        # every ray, so a frame that answers almost nowhere is not a posture and
+        # not an empty room: it is a blocked view, and the honest report is that
+        # nothing can be seen. This is the one place UNKNOWN means something.
+        return State.UNKNOWN, f
+
     if f["body_cells"] < BODY_MIN:
         return State.EMPTY, f
 
     if not f["touches_top"]:
         # the shape does not reach the top of the frame: the body is low
-        if f["over_toilet"]:
+        if (f["over_toilet"] and f["body_mm"] is not None
+                and f["seat_mm"] is not None
+                and f["body_mm"] <= f["seat_mm"] + BEHIND_SEAT_MM):
             return State.SITTING_AT_TOILET, f
         return State.UNKNOWN, f
 
@@ -129,6 +167,8 @@ def classify(matrix, baseline):
 def explain(f):
     if f["body_cells"] < BODY_MIN:
         return "no body"
+    if f.get("blocked"):
+        return "view blocked (%d dead rays)" % f["dead_rays"]
     return ("%d cells (%d returned, %d no-return) rows %d-%d top=%s toilet=%s "
             "body=%smm" % (f["body_cells"], f["returned"], f["no_return"],
                            f["rows"][0] + 1, f["rows"][-1] + 1,
