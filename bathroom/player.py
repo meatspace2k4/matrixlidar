@@ -25,6 +25,7 @@ succeeded because a set accepted mid-handshake could still be overridden. All of
 that is the cost of using two processes where one session does the job.
 """
 import asyncio
+import time
 
 
 def _pyatv():
@@ -48,6 +49,9 @@ def _pyatv():
 
 
 import sys
+
+
+CONNECT_WAIT_S = 6.0   # how long a fade waits for the session to come up
 
 
 class PlayError(Exception):
@@ -147,14 +151,27 @@ class Playback:
         return bool(self._done) and not self._done.is_set()
 
     def fade(self, seconds=2.0, timeout=5.0):
-        """Fade the track out over `seconds` and stop it."""
-        if self._loop and self._atv is not None:
-            fut = asyncio.run_coroutine_threadsafe(
-                fade_out(self._atv, self._volume, seconds), self._loop)
-            try:
-                fut.result(timeout=seconds + 2)
-            except Exception:
-                pass
+        """Fade the track out over `seconds`, then stop it.
+
+        Waits for the connection first. `start` returns before the scan and
+        connect finish, so a fade arriving early found `_atv` unset, skipped the
+        ramp, and cut: measured at exactly 5.00s, which is stop()'s join
+        timeout, not a fade. Being silent about that is what hid it twice.
+        """
+        deadline = time.time() + CONNECT_WAIT_S
+        while self._atv is None and self.is_playing() and time.time() < deadline:
+            time.sleep(0.05)
+        if self._atv is None:
+            sys.stderr.write("fade: no session after %.1fs; cutting\n"
+                             % CONNECT_WAIT_S)
+            self.stop(timeout)
+            return
+        fut = asyncio.run_coroutine_threadsafe(
+            fade_out(self._atv, self._volume, seconds), self._loop)
+        try:
+            fut.result(timeout=seconds + 2)
+        except Exception as e:
+            sys.stderr.write("fade: ramp failed (%s); cutting\n" % e)
         self.stop(timeout)
 
     def stop(self, timeout=5.0):
