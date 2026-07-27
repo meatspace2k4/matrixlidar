@@ -6,6 +6,8 @@ Not an emulator and not a Pi image. One TCP server that does what
 
   - accepts connections, then writes one line per frame, 64 comma-separated
     raw row-major mm values, at the recorded rate
+  - writes "IR <json>" for each IR signal the clip recorded, at the point in
+    the replay its timestamp falls in
   - accepts "MARK <json>" from the client and keeps it in a RAM ring with a
     snapshot of the latest raw frame, grouped into sessions
   - answers "DUMP" with `ARCHIVE <json>` of the ring
@@ -43,23 +45,40 @@ def unorient(m):
 
 
 def load_frames(paths):
-    """[(dt_seconds, raw 8x8)] from one or more recorded clips, in order."""
+    """([(dt_seconds, raw 8x8, t_elapsed)], [ir events]) from recorded clips.
+
+    `t_elapsed` runs across ALL the clips, not per clip, and the IR events are
+    shifted onto that same axis: clip 2's presses have to replay during clip
+    2's frames, not at the start. A clip recorded before the IR log existed
+    (schema /1) simply contributes no events.
+    """
     out = []
+    ir = []
+    elapsed = 0.0
     for p in paths:
         with open(p) as f:
             doc = json.load(f)
         prev = None
+        first = elapsed
         for fr in doc["frames"]:
-            oriented = [fr["mm"][i * N:(i + 1) * N] for i in range(N)]
             dt = 0.0 if prev is None else max(0.0, fr["t"] - prev)
             prev = fr["t"]
-            out.append((dt, unorient(oriented)))
-    return out
+            elapsed += dt
+            oriented = [fr["mm"][i * N:(i + 1) * N] for i in range(N)]
+            out.append((dt, unorient(oriented), elapsed))
+        for ev in doc.get("ir") or []:
+            # Clamp to 0: a press caught between the receiver opening and the
+            # first frame has a small negative t in the clip. It happened, so
+            # it replays, at the top.
+            ir.append(dict(ev, t=max(0.0, ev.get("t", 0.0)) + first))
+    ir.sort(key=lambda e: e["t"])
+    return out, ir
 
 
 class Stub:
-    def __init__(self, frames, loop=True, empty_gap=0.0):
+    def __init__(self, frames, loop=True, empty_gap=0.0, ir=()):
         self.frames = frames
+        self.ir = list(ir)
         self.loop = loop
         self.empty_gap = empty_gap
         self.latest_raw = frames[0][1] if frames else [[4000] * N for _ in range(N)]
@@ -74,8 +93,9 @@ class Stub:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((host, port))
         srv.listen(8)
-        sys.stderr.write("stub pi on %s:%d, %d frames, loop=%s\n"
-                         % (host, port, len(self.frames), self.loop))
+        sys.stderr.write("stub pi on %s:%d, %d frames, %d ir, loop=%s\n"
+                         % (host, port, len(self.frames), len(self.ir),
+                            self.loop))
         sys.stderr.flush()
         while True:
             conn, _addr = srv.accept()
@@ -86,13 +106,23 @@ class Stub:
         reader.start()
         try:
             while True:
-                for dt, raw in self.frames:
+                i = 0    # next IR event; the log is sorted by t
+                for dt, raw, t in self.frames:
                     if dt:
                         time.sleep(dt)
+                    # Everything due by this frame's timestamp goes out just
+                    # ahead of it, so a client reading the stream in order sees
+                    # the signal against the same frame it was recorded against.
+                    while i < len(self.ir) and self.ir[i]["t"] <= t:
+                        conn.sendall(("IR " + json.dumps(self.ir[i])
+                                      + "\n").encode())
+                        i += 1
                     with self._lock:
                         self.latest_raw = raw
                     line = ",".join(str(v) for row in raw for v in row) + "\n"
                     conn.sendall(line.encode())
+                for ev in self.ir[i:]:   # recorded after the last frame
+                    conn.sendall(("IR " + json.dumps(ev) + "\n").encode())
                 if not self.loop:
                     break
                 if self.empty_gap:
@@ -155,11 +185,13 @@ def main():
     ap.add_argument("--gap", type=float, default=0.0,
                     help="seconds of pause between loops")
     args = ap.parse_args()
-    frames = load_frames(args.clip)
+    frames, ir = load_frames(args.clip)
     if not frames:
         sys.stderr.write("no frames loaded\n")
         return 1
-    Stub(frames, loop=not args.once, empty_gap=args.gap).serve(args.port, args.host)
+    sys.stderr.write("ir log: %d signals\n" % len(ir))
+    Stub(frames, loop=not args.once, empty_gap=args.gap,
+         ir=ir).serve(args.port, args.host)
     return 0
 
 

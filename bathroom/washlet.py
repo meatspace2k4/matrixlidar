@@ -25,6 +25,11 @@ Decisions:
 - REARM: --day-start (05:00) passes -> clear the latch. This is the ONLY
   clock-driven decision, and the only thing that rearms a running daemon.
 
+IR signals on the stream ("IR <json>" lines, which is what a replayed clip's
+recorded IR log arrives as) are PRINTED with their NEC address and nothing
+else: they trigger no audio and touch no latch. The remote is not a control
+surface for this daemon, it is something the recording noticed.
+
 Every stream start gets the volume poke (a second atvremote, retried
 across the startup window because a set accepted mid-handshake can be
 overridden when audio starts); the session's own starting volume is
@@ -48,7 +53,7 @@ import time
 
 from collections import deque
 
-from . import archive, classify, config, detect, occupancy, player as player_mod, posture3d, scene as scene_mod, stream, threshold
+from . import archive, classify, config, detect, ir as ir_mod, occupancy, player as player_mod, posture3d, scene as scene_mod, stream, threshold
 from .donewith import DoneWith, FADE
 from .engine import StateEngine
 from .live import DRIFT_FRAMES, _direction
@@ -466,6 +471,16 @@ def main():
                      "door": None if door.pct is None else round(door.pct),
                      "occ": u.features["occ_count"],
                      "dir": _direction(col_hist).strip()}))
+
+            # IR signals arrive on the same stream as the frames, as their own
+            # line type. Nothing is triggered by them: they are printed, with
+            # the address they carry, against the frame time they landed on.
+            # A replay (evals/stub_pi.py serving a clip with an `ir` log) is
+            # where they come from; the live server sends none and this stays
+            # quiet.
+            for ev in stream.drain_ir():
+                _log("IR    t=%7.2fs  %s" % (ev.get("t", t),
+                                             ir_mod.format_event(ev)))
 
             rc = player.reap()
             if rc is not None:

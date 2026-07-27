@@ -13,6 +13,22 @@ which is the whole point of training a sequence model.
 Each clip is one self-describing JSON file under data/clips/, and a one-line
 summary is appended to data/manifest.jsonl for indexing. Run the heatmap
 client alongside to watch what you are labeling; both share the warm stream.
+
+IR
+
+A clip also carries an `ir` log: every IR frame the receiver decoded during
+the capture, each with the NEC ADDRESS it was addressed to, on the same time
+axis as the lidar frames. It is a LOG, not a per-frame column -- IR arrives
+when a button is pressed and the lidar arrives at 10 Hz, and forcing the
+sparse one into the dense one would invent a value for every frame nobody
+pressed anything in.
+
+The receiver is local hardware (see bathroom/ir.py), so the IR log is only
+ever non-empty when this runs ON the Pi the sensor is wired to. Recording
+from a laptop still works and still records lidar; the clip then says the
+receiver was absent and why, in `ir_source`. A clip that claims nothing
+about IR and a clip that recorded no presses are different facts, and the
+file distinguishes them.
 """
 import argparse
 import json
@@ -22,12 +38,16 @@ import time
 
 from . import config
 from . import detect
+from . import ir as ir_mod
 from . import stream
 from .classify import median_window
 from .engine import StateEngine
 from .zones import N, ORIENTATION
 
-SCHEMA = "bathroom-clip/1"
+# 2: same frames, same fields, plus the `ir` log and `ir_source`. A reader of
+# a /1 clip is not wrong about it, it just has no IR to read, so nothing that
+# consumes clips needs to care which one it has.
+SCHEMA = "bathroom-clip/2"
 BASELINE_SECONDS = 6
 
 
@@ -64,16 +84,22 @@ def _corpus_hint():
         sys.stderr.write("corpus so far: %s   (lightest: %s)\n" % (mix, fewest))
 
 
-def _status(state, n, elapsed, door):
-    sys.stderr.write("\r\x1b[K  rec %-18s frames=%-4d  %5.1fs  door=%3.0f%%"
-                     % (state.name, n, elapsed, door))
+def _status(state, n, elapsed, door, ir_n=0):
+    sys.stderr.write("\r\x1b[K  rec %-18s frames=%-4d  %5.1fs  door=%3.0f%%  ir=%d"
+                     % (state.name, n, elapsed, door, ir_n))
     sys.stderr.flush()
 
 
-def _capture(seconds, on_frame):
+def _capture(seconds, on_frame, start=None):
     """Pull frames from the warm stream until `seconds` elapse (0 = until the
-    user interrupts). Returns the wall-clock start time. Ctrl-C ends cleanly."""
-    start = time.time()
+    user interrupts). Returns the wall-clock start time. Ctrl-C ends cleanly.
+
+    `start` overrides the origin of the t axis. The IR receiver is opened
+    before this is called and its events are stamped against the same origin;
+    letting each pick its own time.time() would put the two logs on axes that
+    differ by however long the corpus hint took to print.
+    """
+    start = time.time() if start is None else start
     deadline = start + seconds if seconds > 0 else None
     try:
         for m in stream.frames(on_wait=_waiting):
@@ -83,6 +109,34 @@ def _capture(seconds, on_frame):
     except KeyboardInterrupt:
         pass
     return start
+
+
+def _ir_addresses(ir_log):
+    """{address_hex: count} over a clip's IR log.
+
+    The addresses are the summary worth having: which remotes were talking
+    during this capture, and how much. Counts every frame including repeats,
+    because the per-event `repeat` flag is right there in the log for anyone
+    who wants presses instead.
+    """
+    counts = {}
+    for ev in ir_log:
+        k = ev.get("address_hex", "0x%02X" % ev.get("address", 0))
+        counts[k] = counts.get(k, 0) + 1
+    return counts
+
+
+def _open_receiver():
+    """(receiver, source) for the IR side of a capture. Never raises: a
+    machine with no receiver records lidar exactly as it did before, and the
+    clip carries the reason instead of an IR log."""
+    rx = ir_mod.Receiver()
+    rx.start()
+    sys.stderr.write(ir_mod.describe(rx.source) + "\n")
+    # A COPY: the clip should record what the receiver was DURING the capture.
+    # rx.source is live and close() rewrites its state to "closed", which is
+    # true of the receiver afterwards and says nothing about the recording.
+    return rx, dict(rx.source)
 
 
 def _waiting(attempt, total):
@@ -101,6 +155,13 @@ def record_clip(label, seconds, notes=None):
     eng = StateEngine(baseline=baseline)
     door = detect.DoorReading(baseline)
     frames = []
+    ir_log = []
+    rx, ir_source = _open_receiver()
+    # One origin for both logs, fixed before either starts (see _capture). A
+    # press that lands between the receiver opening and the first frame
+    # arriving is still a press: it keeps its real, slightly negative t rather
+    # than being dropped or clamped.
+    t0 = time.time()
 
     def on_frame(m, t):
         u = eng.update(m, t)
@@ -111,12 +172,18 @@ def record_clip(label, seconds, notes=None):
             "state_auto": u.instant.name,        # per-frame classifier (raw)
             "state_engine": u.committed.name,    # debounced temporal engine
         })
-        _status(u.committed, len(frames), t, frames[-1]["door_open_pct"])
+        # Drained once per frame, so the queue never grows and every event
+        # gets its t from the kernel's own timestamp, not from this loop.
+        ir_log.extend(rx.drain(t0))
+        _status(u.committed, len(frames), t, frames[-1]["door_open_pct"],
+                len(ir_log))
 
     _corpus_hint()
     sys.stderr.write("recording label=%r (%s). Ctrl-C to stop.\n"
                      % (label, "%ds" % seconds if seconds else "open-ended"))
-    start = _capture(seconds, on_frame)
+    start = _capture(seconds, on_frame, start=t0)
+    ir_log.extend(rx.drain(t0))   # the tail: presses after the last frame
+    rx.close()
     sys.stderr.write("\n")
 
     if not frames:
@@ -144,6 +211,9 @@ def record_clip(label, seconds, notes=None):
         "auto_state_counts": auto_counts,
         "timeline": eng.segments(),     # debounced state segments over the clip
         "notes": notes,
+        "ir_source": ir_source,         # which receiver, or why there was none
+        "ir_addresses": _ir_addresses(ir_log),  # {address_hex: count}, at a glance
+        "ir": ir_log,                   # every decoded frame, in arrival order
         "frames": frames,
     }
     path = "%s/%s.json" % (config.CLIPS_DIR, clip_id)
@@ -156,6 +226,7 @@ def record_clip(label, seconds, notes=None):
                 "clip_id": clip_id, "label": label, "n": len(frames),
                 "hz": doc["hz"], "started": doc["started"],
                 "auto_state_counts": auto_counts, "file": path, "notes": notes,
+                "ir_n": len(ir_log), "ir_addresses": doc["ir_addresses"],
             }) + "\n")
     except OSError as e:
         sys.stderr.write("warning: clip saved but manifest update failed: %s\n" % e)
@@ -164,6 +235,13 @@ def record_clip(label, seconds, notes=None):
                      % (len(frames), doc["hz"], path))
     sys.stderr.write("auto-state mix: %s\n"
                      % ", ".join("%s=%d" % kv for kv in sorted(auto_counts.items())))
+    if ir_log:
+        sys.stderr.write("ir: %d signals from %s\n"
+                         % (len(ir_log),
+                            ", ".join("%s x%d" % kv
+                                      for kv in sorted(doc["ir_addresses"].items()))))
+    else:
+        sys.stderr.write("ir: none (%s)\n" % ir_mod.describe(ir_source))
     return 0
 
 
