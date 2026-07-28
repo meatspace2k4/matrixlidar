@@ -28,7 +28,6 @@ from .engine import StateEngine
 from .zones import N, ORIENTATION
 
 SCHEMA = "bathroom-clip/1"
-WINDOW = 5  # trailing frames the per-frame auto state is denoised over
 BASELINE_SECONDS = 6
 
 
@@ -94,8 +93,13 @@ def _waiting(attempt, total):
 
 def record_clip(label, seconds, notes=None):
     config.ensure_dirs()
+    # A clip stores the baseline it was captured against and downstream that
+    # field IS the scene, so this must be a real scan. config.load_baseline
+    # raises rather than substituting one; three clips in this corpus predate
+    # that and had to be repaired by hand.
     baseline = config.load_baseline()
-    eng = StateEngine(baseline=baseline, window=WINDOW)
+    eng = StateEngine(baseline=baseline)
+    door = detect.DoorReading(baseline)
     frames = []
 
     def on_frame(m, t):
@@ -103,7 +107,7 @@ def record_clip(label, seconds, notes=None):
         frames.append({
             "t": round(t, 3),
             "mm": _flat(m),
-            "door_open_pct": detect.door_open_pct(m),
+            "door_open_pct": door.update(m),
             "state_auto": u.instant.name,        # per-frame classifier (raw)
             "state_engine": u.committed.name,    # debounced temporal engine
         })

@@ -21,7 +21,7 @@ import json
 import sys
 
 from . import config, ingest, metrics
-from .classify import classify_window
+from .classify import classify
 from .engine import StateEngine
 from .zones import State, from_label
 
@@ -38,38 +38,31 @@ def _dominant(states):
 
 
 class FramePredictor:
-    """Per-frame classifier; clip label = dominant per-frame state."""
+    """Per-frame classifier; clip label = dominant per-frame state. Each
+    frame is classified independently, no cross-frame averaging."""
     name = "frame"
 
-    def __init__(self, baseline, window=5):
+    def __init__(self, baseline):
         self.baseline = baseline
-        self.window = window
 
-    def per_frame(self, frames):
-        from collections import deque
-        win = deque(maxlen=self.window)
-        out = []
-        for m in frames:
-            win.append(m)
-            st, _ = classify_window(list(win), self.baseline)
-            out.append(st)
-        return out
+    def per_frame(self, frames, baseline=None):
+        base = baseline or self.baseline
+        return [classify(m, base)[0] for m in frames]
 
-    def predict(self, frames):
-        return _dominant(self.per_frame(frames))
+    def predict(self, frames, baseline=None):
+        return _dominant(self.per_frame(frames, baseline))
 
 
 class EnginePredictor:
     """Debounced temporal engine; clip label = dominant committed state."""
     name = "engine"
 
-    def __init__(self, baseline, window=5, commit_after=4):
+    def __init__(self, baseline, commit_after=4):
         self.baseline = baseline
-        self.window = window
         self.commit_after = commit_after
 
-    def per_frame(self, frames):
-        eng = StateEngine(baseline=self.baseline, window=self.window,
+    def per_frame(self, frames, baseline=None):
+        eng = StateEngine(baseline=baseline or self.baseline,
                           commit_after=self.commit_after)
         out = []
         for i, m in enumerate(frames):
@@ -77,8 +70,8 @@ class EnginePredictor:
         eng.close()
         return out
 
-    def predict(self, frames):
-        eng = StateEngine(baseline=self.baseline, window=self.window,
+    def predict(self, frames, baseline=None):
+        eng = StateEngine(baseline=baseline or self.baseline,
                           commit_after=self.commit_after)
         for i, m in enumerate(frames):
             eng.update(m, i / 15.0)
@@ -115,17 +108,24 @@ def run(predictor, samples, frame_level=False):
         if s.state is None:
             rows.append((s.id, s.label, "?", "UNLABELED (label not recognized)"))
             continue
-        truth = s.state.name
+        # clip truth is the dominant PER-FRAME truth, so a clip whose label
+        # covers a span the operator has since corrected is compared against
+        # what it actually holds (see ingest.LabeledSample.states)
+        truth = s.dominant_state().name
         if isinstance(predictor, PredictionsFilePredictor):
             pred = predictor.predict_for(s).name
             clip_pairs.append((truth, pred))
             rows.append((s.id, s.label, pred, "ok" if pred == truth else "MISS"))
             continue
-        pred = predictor.predict(s.frames).name
+        # score every sample against the baseline it was captured against,
+        # never today's live scene (the room drifts; that drift would read as
+        # depression in cells the body never touched)
+        pred = predictor.predict(s.frames, s.baseline).name
         clip_pairs.append((truth, pred))
         if frame_level and hasattr(predictor, "per_frame"):
-            for st in predictor.per_frame(s.frames):
-                frame_pairs.append((truth, st.name))
+            for want, st in zip(s.states, predictor.per_frame(s.frames, s.baseline)):
+                if want is not None:
+                    frame_pairs.append((want.name, st.name))
         rows.append((s.id, s.label, pred, "ok" if pred == truth else "MISS"))
     return clip_pairs, frame_pairs, rows
 

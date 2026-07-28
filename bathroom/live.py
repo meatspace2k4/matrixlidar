@@ -2,7 +2,6 @@
 rolling occupancy sparkline and a colored state strip.
 
   python3 -m bathroom.live              # one rewriting status line + a sparkline
-  python3 -m bathroom.live --verbose    # also log each committed transition
 
 State transitions are logged to scrollback as they commit; the bottom line
 rewrites in place with the current state (plus a <- / -> direction arrow while
@@ -10,12 +9,12 @@ WALKING), door%, the occupancy sparkline, and the recent state strip. On exit
 it prints the session timeline.
 """
 import argparse
+import shutil
 import sys
 import time
 from collections import deque
 
-from . import archive, config, detect, occupancy, stream, sparkline
-from .engine import StateEngine
+from . import occupancy, stream, sparkline
 from .zones import State
 
 HIST = 32  # columns of rolling history in the sparkline + state strip
@@ -37,65 +36,68 @@ def _direction(col_hist):
 
 def main():
     ap = argparse.ArgumentParser(description="Live e2e state readout with sparkline")
-    ap.add_argument("--verbose", action="store_true",
-                    help="log the feature vector on each committed transition")
-    ap.add_argument("--commit-after", type=int, default=4,
-                    help="frames a candidate must hold before the state flips")
-    args = ap.parse_args()
+    ap.parse_args()
 
-    baseline = config.load_baseline()
-    eng = StateEngine(baseline=baseline, commit_after=args.commit_after)
-    room_eng = occupancy.OccupancyEngine()
-    marker = archive.Marker()
+    # THE SERVICE DERIVES, THE VIEWER DISPLAYS. Everything on this line comes
+    # from the published STATE feed; this process runs no engine and reads no
+    # baseline.
     occ_hist = deque(maxlen=HIST)
     state_hist = deque(maxlen=HIST)
-    col_hist = deque(maxlen=DRIFT_FRAMES)
-    t0 = None
+    last_shown = None   # (posture, room) last logged to scrollback
+    door_held = None
+    seen_ts = None      # last STATE arrival consumed into the histories
     try:
         for m in stream.frames(on_wait=_waiting):
-            now = time.time()
-            t0 = t0 if t0 is not None else now
-            u = eng.update(m, now - t0)
-            door = detect.door_open_pct(m)
-            ru = room_eng.update(u, now - t0, door_pct=door)
-            marker.update(u, ru, now - t0)
-            occ_hist.append(u.features["occ_count"])
-            state_hist.append(u.committed)
-            cells = u.features["occ_cells"]
-            if cells:
-                col_hist.append(sum(c for _r, c in cells) / float(len(cells)))
+            st = stream.state()
+            if st is None:
+                shown = "NO STATE FEED"
+                room_txt = "(service not publishing)"
             else:
-                col_hist.clear()
-
-            if ru.event is not None:
-                sys.stdout.write("\r\x1b[K%s  room -> %-9s (%s)\n"
-                                 % (time.strftime("%H:%M:%S"), ru.room, ru.event))
-            if u.changed and u.event is not None:
-                sys.stdout.write("\r\x1b[K%s  %-18s -> %-18s (%.1fs)\n"
-                                 % (time.strftime("%H:%M:%S"), u.event.state.name,
-                                    u.committed.name, u.event.duration))
-                if args.verbose:
-                    f = u.features
-                    sys.stdout.write("           occ=%d vnear=%d up=%d low=%d toto=%d min=%s\n"
-                                     % (f["occ_count"], f["vnear_count"], f["upper_count"],
-                                        f["lower_count"], int(f["toto_occluded"]), f["min_mm"]))
-
-            spark = sparkline.sparkline(occ_hist, lo=0, hi=max(8, max(occ_hist)))
-            strip = sparkline.state_strip(state_hist)
-            shown = u.committed.name
-            if u.committed == State.WALKING:
-                shown += _direction(col_hist)   # '<-' left / '->' right
-            room_txt = "%s(%d) %s" % (ru.room, ru.occupants,
-                                      occupancy.fmt_duration((now - t0) - ru.since))
-            sys.stdout.write("\r\x1b[K%-20s %-21s inst=%-18s door=%3.0f%% |%s| %s"
-                             % (room_txt, shown, u.instant.name, door, spark, strip))
+                posture = st.get("posture", "UNKNOWN")
+                room = st.get("room")
+                if stream.last_state_ts != seen_ts:   # one column per publish
+                    seen_ts = stream.last_state_ts
+                    occ_hist.append(st.get("occ", 0))
+                    state_hist.append(State[posture] if posture in State.__members__
+                                      else State.UNKNOWN)
+                if (posture, room) != last_shown:
+                    if last_shown is not None:
+                        sys.stdout.write("\r\x1b[K%s  %-18s room=%-9s%s\n"
+                                         % (time.strftime("%H:%M:%S"), posture,
+                                            room, (" (%s)" % st["event"])
+                                            if st.get("event") else ""))
+                    last_shown = (posture, room)
+                shown = posture
+                if st.get("blocked"):
+                    shown = "VIEW BLOCKED"
+                elif st.get("dir"):
+                    shown += " " + st["dir"]        # '<-' left / '->' right
+                room_txt = "%s(%d) %s" % (
+                    room, st.get("occupants", 0),
+                    occupancy.fmt_duration(st.get("t", 0) - st.get("since", 0)))
+                if st.get("door") is not None:
+                    door_held = st["door"]
+            door_txt = "  --" if door_held is None else "%3.0f%%" % door_held
+            lead = "%-20s %-21s door=%-5s " % (room_txt, shown, door_txt)
+            # fit the line to the terminal: a wrapped line cannot be
+            # rewritten with \r and scrolls a new row per frame instead
+            cols = shutil.get_terminal_size(fallback=(120, 24)).columns
+            if len(lead) > cols - 1:
+                lead = lead[:max(0, cols - 1)]  # plain text, safe to slice
+            avail = cols - len(lead) - 1
+            spark = strip = ""
+            if avail >= 12 and occ_hist:
+                spark_w = min(HIST, max(8, (avail - 3) // 2))
+                strip_w = min(HIST, avail - spark_w - 3)
+                spark = "|%s|" % sparkline.sparkline(
+                    list(occ_hist)[-spark_w:], lo=0, hi=max(8, max(occ_hist)))
+                if strip_w >= 8:
+                    spark += " " + sparkline.state_strip(
+                        list(state_hist)[-strip_w:])
+            sys.stdout.write("\r\x1b[K%s%s" % (lead, spark))
             sys.stdout.flush()
     except (KeyboardInterrupt, ConnectionError) as e:
-        eng.close()
-        sys.stdout.write("\n\nsession timeline:\n")
-        for s in eng.segments():
-            sys.stdout.write("  %-18s %6.1fs  %4d frames\n"
-                             % (s["state"], s["duration"], s["n_frames"]))
+        sys.stdout.write("\n")
         if isinstance(e, ConnectionError):
             sys.stdout.write("%s\n" % e)
     return 0

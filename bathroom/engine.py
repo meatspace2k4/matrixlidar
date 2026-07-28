@@ -1,23 +1,34 @@
 """End-to-end temporal state engine.
 
 classify.py answers "what does THIS frame look like"; the engine answers
-"what state is the room actually in, over time". It debounces the per-frame
-classifier with hysteresis so a single flicker frame can't flip the committed
-state, tracks dwell time, and emits a timeline of stable segments. This is the
-temporal machine the original package deferred.
+"what state is the room actually in, over time". Each RAW frame is classified
+independently: no cross-frame pixel averaging. Temporal stability is decision-
+level only, a hysteresis requiring the same candidate state to repeat
+commit_after consecutive raw frames before the committed state flips, so a
+single flicker frame can't flip it. It tracks dwell time and emits a timeline
+of stable segments. This is the temporal machine the original package
+deferred.
 
-  raw stream -> orient -> classify_window -> StateEngine -> committed state
-                                                          + transition events
-                                                          + timeline
+  raw stream -> orient -> classify -> StateEngine -> committed state
+                                                    + transition events
+                                                    + timeline
+
+Earlier revisions ran classify_window() here: a 5-frame per-cell MEDIAN
+across raw frames, classified as if it were one real reading. That merges
+real sensor grids into a synthetic one that existed at no instant, and it sat
+underneath the commit_after hysteresis rather than replacing it, so a body's
+natural micro-movement near a threshold could get median-merged into a shape
+no single frame supported (this is what actually produced the operator's
+SITTING<->STANDING flapping: the single frame attached to each flap read
+SITTING every time; only the window-merged classification read STANDING).
+Removed: classify the raw frame, debounce the label.
 
 A segment is one stable stretch of a single state: (state, t_start, t_end,
 n_frames). The timeline is the closed-segment history; `current` is the open
 one. Segments are exactly the spans a sequence model is trained to reproduce,
 so the engine's timeline doubles as auto-labels to check the model against.
 """
-from collections import deque
-
-from .classify import classify_window
+from .classify import classify
 from .zones import State
 
 
@@ -46,9 +57,12 @@ class Segment:
 
 class Update:
     """One engine step's result (what live views and recorders consume)."""
-    __slots__ = ("committed", "instant", "changed", "event", "features", "t")
+    __slots__ = ("committed", "instant", "changed", "event", "features", "t",
+                 "matrix")
 
-    def __init__(self, committed, instant, changed, event, features, t):
+    def __init__(self, committed, instant, changed, event, features, t,
+                 matrix=None):
+        self.matrix = matrix            # the oriented frame this Update is for
         self.committed = committed      # the debounced, stable state
         self.instant = instant          # this frame's raw classifier state
         self.changed = changed          # True on the frame a transition commits
@@ -60,16 +74,20 @@ class Update:
 class StateEngine:
     """Debounced state machine over the per-frame classifier.
 
-    window       frames the per-frame classifier denoises over (matches live).
     commit_after a candidate state must hold this many consecutive frames
                  before the committed state flips (hysteresis against flicker).
     """
 
-    def __init__(self, baseline=None, window=5, commit_after=4, start=State.EMPTY):
+    def __init__(self, baseline=None, commit_after=4, start=State.EMPTY,
+                 classifier=None):
+        # `classifier` exists because the washlet daemon on the Pi passes one:
+        # it used to swap the posture verdict in from a parallel module while
+        # leaving classify.py's features alone. classify.classify IS that path
+        # now, so the default is the only one anybody needs, and a daemon that
+        # still passes its wrapper keeps working.
+        self._classify = classifier or classify
         self.baseline = baseline
-        self.window = window
         self.commit_after = commit_after
-        self._win = deque(maxlen=window)
         self.committed = start
         self.current = None              # open Segment
         self.timeline = []               # closed Segments
@@ -77,8 +95,16 @@ class StateEngine:
         self._cand_n = 0
 
     def update(self, matrix, t):
-        self._win.append(matrix)
-        instant, feats = classify_window(list(self._win), self.baseline)
+        if self._classify is classify:
+            instant, feats = classify(matrix, self.baseline)
+        else:
+            # A supplied classifier is the washlet daemon's wrapper, written
+            # against the old classify_window(frames, baseline) signature from
+            # when this engine kept a rolling median window. It does not any
+            # more (a median across raw frames invents a grid that existed at no
+            # instant, which is what produced the SITTING<->STANDING flapping),
+            # so it gets a window of one: median_window([m]) is m.
+            instant, feats = self._classify([matrix], self.baseline)
 
         if self.current is None:
             # Bootstrap: adopt the first observation as the initial state. There
@@ -112,7 +138,8 @@ class StateEngine:
 
         self.current.t_end = t
         self.current.n_frames += 1
-        return Update(self.committed, instant, changed, event, feats, t)
+        return Update(self.committed, instant, changed, event, feats, t,
+                      matrix=matrix)
 
     def close(self, t=None):
         """Finalize the open segment (call at end of stream/clip)."""
@@ -141,13 +168,13 @@ class StateEngine:
         return State[name]
 
 
-def run_clip(frames, times=None, baseline=None, window=5, commit_after=4):
+def run_clip(frames, times=None, baseline=None, commit_after=4):
     """Run the engine over a recorded clip (list of oriented matrices).
 
     Returns (per_frame_committed_states, timeline_dicts). `times` defaults to a
     synthetic 15 Hz clock if not supplied.
     """
-    eng = StateEngine(baseline=baseline, window=window, commit_after=commit_after)
+    eng = StateEngine(baseline=baseline, commit_after=commit_after)
     per_frame = []
     occ = []
     for i, m in enumerate(frames):

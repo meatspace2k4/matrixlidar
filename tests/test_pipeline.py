@@ -14,7 +14,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bathroom import dataset, config                       # noqa: E402
-from bathroom.classify import classify_window, DEFAULT_BASELINE  # noqa: E402
+from bathroom.classify import median_window, DEFAULT_BASELINE  # noqa: E402
 from bathroom.zones import N, NO_TARGET, ORIENTATION, from_label, State  # noqa: E402
 
 FAILS = []
@@ -85,19 +85,35 @@ def main():
             f.write("{not json")
         check(len(list(dataset.iter_clips(d))) == 2, "corrupt clip skipped, others survive")
 
-    # robustness: bad baseline file -> built-in default, no crash
+    # A corrupt baseline must RAISE. This check used to assert the opposite
+    # ("corrupt baseline falls back to default"), added one commit after the
+    # fallback itself, which made the footgun a specification: removing it
+    # turned the suite red, and a red suite is what stops anyone from removing
+    # it. Everything downstream measures depth against this grid, so a
+    # substitute scan is not a degraded answer, it is a confident answer about
+    # a different room.
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         f.write("{garbage")
         bad = f.name
-    check(config.load_baseline(bad) == DEFAULT_BASELINE, "corrupt baseline falls back to default")
+    try:
+        config.load_baseline(bad)
+        check(False, "corrupt baseline must raise, not substitute a scan")
+    except config.BaselineError:
+        check(True, "corrupt baseline raises BaselineError")
     os.unlink(bad)
+    missing = bad + ".nope"
+    try:
+        config.load_baseline(missing)
+        check(False, "missing baseline must raise, not substitute a scan")
+    except config.BaselineError:
+        check(True, "missing baseline raises BaselineError")
 
     # empty-window guard
     try:
-        classify_window([])
-        check(False, "classify_window([]) should raise")
+        median_window([])
+        check(False, "median_window([]) should raise")
     except ValueError:
-        check(True, "classify_window([]) raises ValueError")
+        check(True, "median_window([]) raises ValueError")
 
     # State.EMPTY (value 0) must round-trip through from_label without truthiness bugs
     check(from_label("empty") is State.EMPTY, "from_label('empty') -> EMPTY")

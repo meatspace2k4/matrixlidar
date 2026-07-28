@@ -4,7 +4,8 @@ The model and the engine are both validated against the SAME labeled samples.
 This module is the single reader that turns the operator's various labeled
 artifacts into one shape:
 
-  LabeledSample: id, label(str), state(State|None), frames(list[8x8]), source
+  LabeledSample: id, label(str), state(State|None), frames(list[8x8]), source,
+                 baseline(8x8)
 
 Sources understood:
   fixtures/labeled/*.json   schema bathroom-labeled/1 (seed single frames)
@@ -13,32 +14,58 @@ Sources understood:
 Both store frames as flat row-major oriented `mm` arrays; we reshape to 8x8.
 `state` is the normalized ground truth (None if the label is unrecognized, so
 junk labels surface instead of silently scoring as a class).
+
+Each sample also carries the baseline it was CAPTURED AGAINST: clips store
+one, seeds predate the stored-baseline format and belong to the frozen
+DEFAULT_BASELINE scene. Scoring a historical frame against today's live
+baseline is wrong: the room drifts (a moved fixture, a shifted scene), and
+that drift becomes phantom depression in cells the body never touched.
 """
 import glob
 import json
 import os
 import sys
 
-from . import config
+from . import config, dataset
+from .classify import DEFAULT_BASELINE
 from .zones import N, from_label
 
 FIXTURES_DIR = os.path.join(config.ROOT, "fixtures", "labeled")
 
 
 class LabeledSample:
-    __slots__ = ("id", "label", "state", "frames", "source", "path")
+    __slots__ = ("id", "label", "state", "frames", "source", "path", "baseline",
+                 "states")
 
-    def __init__(self, id, label, frames, source, path):
+    def __init__(self, id, label, frames, source, path, baseline=None,
+                 labels=None):
         self.id = id
         self.label = label
         self.state = from_label(label)
         self.frames = frames
         self.source = source
         self.path = path
+        # the scene this sample was captured against, not today's scene
+        self.baseline = baseline or DEFAULT_BASELINE
+        # PER-FRAME ground truth. A capture labeled "walking" opens with the
+        # operator not yet in the room and a capture labeled "sitting" opens
+        # with the walk in; scoring those frames against the clip's one label
+        # measures the label's coarseness, not the classifier. `corrections`
+        # (bathroom.review --relabel) is where the operator says which span is
+        # which, so honour it here instead of discarding it.
+        self.states = ([from_label(x) for x in labels] if labels
+                       else [self.state] * len(frames))
 
     @property
     def n(self):
         return len(self.frames)
+
+    def dominant_state(self):
+        """The state the sample is mostly OF, over its per-frame truth."""
+        tally = {}
+        for s in self.states:
+            tally[s] = tally.get(s, 0) + 1
+        return max(tally, key=tally.get) if tally else self.state
 
 
 def _reshape(flat):
@@ -56,8 +83,11 @@ def _load_file(path, strict=True):
         sys.stderr.write("warning: skipping unreadable sample %s: %s\n" % (path, e))
         return None
     sid = os.path.splitext(os.path.basename(path))[0]
+    doc.setdefault("n", len(frames))
     return LabeledSample(sid, doc.get("label"), frames,
-                         doc.get("source") or doc.get("schema", "?"), path)
+                         doc.get("source") or doc.get("schema", "?"), path,
+                         baseline=doc.get("baseline"),
+                         labels=dataset.effective_labels(doc))
 
 
 def _load_dir(d):

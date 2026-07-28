@@ -14,9 +14,7 @@ import sys
 import time
 from collections import deque
 
-from bathroom import archive, config, detect, occupancy, sparkline, stream
-from bathroom.engine import StateEngine
-from bathroom.live import DRIFT_FRAMES, _direction
+from bathroom import detect, occupancy, sparkline, stream
 from bathroom.zones import N, NO_TARGET, State, Zone
 
 NEAR_MM = 100
@@ -55,9 +53,10 @@ def color_for(mm):
 HOLD_FRAMES = 6  # bridge dropouts this long; beyond it the cell is truly empty
 _hold = [[NO_TARGET] * N for _ in range(N)]       # last real value (display only)
 _stale = [[HOLD_FRAMES + 1] * N for _ in range(N)]  # frames since that value
+_zone_hold = {}  # last real zone median / door pct (display only, starred when held)
 
 
-def render(m, state_name, room_txt, occ_hist, state_hist):
+def render(m, state_name, room_txt, occ_hist, state_hist, door_pct):
     out = ["\x1b[H", "\x1b[1m DFRobot Matrix Lidar  8x8 heatmap (cm)\x1b[0m\x1b[K\n\n"]
     for r in range(N):
         line = []
@@ -83,9 +82,21 @@ def render(m, state_name, room_txt, occ_hist, state_hist):
     out.append(" far/none\x1b[K\n\x1b[K\n")
     for z in (Zone.TOTO, Zone.DOOR, Zone.FRAME):
         v = detect.zone_values(m, z)
-        extra = "  open=%.0f%%" % detect.door_open_pct(m) if z == Zone.DOOR else ""
-        out.append("  %d %-9s %4d cm%s\x1b[K\n"
-                   % (int(z), z.name, (v["median"] + 5) // 10, extra))
+        # hold the last real reading instead of flapping to --: a blank frame
+        # changes the line width and shoves the panel around
+        if v["median"] is not None:
+            _zone_hold[z] = v["median"]
+        mm = v["median"] if v["median"] is not None else _zone_hold.get(z)
+        cm = " -- " if mm is None else "%4d" % ((mm + 5) // 10)
+        extra = ""
+        if z == Zone.DOOR:
+            # the service's published door reading, not anything derived here
+            if door_pct is not None:
+                _zone_hold["door_pct"] = door_pct
+            pct = _zone_hold.get("door_pct")
+            extra = ("  open=  --" if pct is None else "  open=%3.0f%%" % pct)
+        out.append("  %d %-9s %s cm  %d/%d rays%s\x1b[K\n"
+                   % (int(z), z.name, cm, v["returns"], v["rays"], extra))
     out.append("\x1b[K\n \x1b[1mSTATE: %-22s\x1b[0m\x1b[K\n" % state_name)
     out.append(" \x1b[1mROOM:  %-26s\x1b[0m\x1b[K\n" % room_txt)
     hi = max(8, max(occ_hist) if occ_hist else 8)
@@ -102,40 +113,42 @@ def _waiting(attempt, total):
 
 
 def main():
-    baseline = config.load_baseline()
-    eng = StateEngine(baseline=baseline)
-    room_eng = occupancy.OccupancyEngine()
-    marker = archive.Marker()
+    # THE SERVICE DERIVES, THE VIEWER DISPLAYS. Everything on screen except
+    # the raw cells comes from the published STATE feed: posture, room,
+    # duration, door%, occlusion, occ count, walking direction. This process
+    # runs no engine and reads no baseline.
     occ_hist = deque(maxlen=HIST)
     state_hist = deque(maxlen=HIST)
-    col_hist = deque(maxlen=DRIFT_FRAMES)
     started = False
-    t0 = None
+    seen_ts = None      # last STATE arrival consumed into the histories
     try:
         for m in stream.frames(on_wait=_waiting):
             if not started:
                 sys.stderr.write("\r\x1b[K")
                 sys.stdout.write("\x1b[2J\x1b[?25l")  # clear, hide cursor
                 started = True
-            now = time.time()
-            t0 = t0 if t0 is not None else now
-            u = eng.update(m, now - t0)
-            ru = room_eng.update(u, now - t0,
-                                 door_pct=detect.door_open_pct(m))
-            marker.update(u, ru, now - t0)
-            occ_hist.append(u.features["occ_count"])
-            state_hist.append(u.committed)
-            cells = u.features["occ_cells"]
-            if cells:
-                col_hist.append(sum(c for _r, c in cells) / float(len(cells)))
+            st = stream.state()
+            if st is None:
+                shown = "NO STATE FEED"
+                room_txt = "(service not publishing)"
+                door_pct = None
             else:
-                col_hist.clear()
-            shown = u.committed.name
-            if u.committed == State.WALKING:
-                shown += _direction(col_hist)   # '<-' left / '->' right
-            room_txt = "%s(%d) %s" % (ru.room, ru.occupants,
-                                      occupancy.fmt_duration((now - t0) - ru.since))
-            render(m, shown, room_txt, occ_hist, state_hist)
+                if stream.last_state_ts != seen_ts:   # one column per publish
+                    seen_ts = stream.last_state_ts
+                    occ_hist.append(st.get("occ", 0))
+                    posture = st.get("posture", "UNKNOWN")
+                    state_hist.append(State[posture] if posture in State.__members__
+                                      else State.UNKNOWN)
+                shown = st.get("posture", "UNKNOWN")
+                if st.get("blocked"):
+                    shown = "VIEW BLOCKED"
+                elif st.get("dir"):
+                    shown += " " + st["dir"]        # '<-' left / '->' right
+                room_txt = "%s(%d) %s" % (
+                    st.get("room"), st.get("occupants", 0),
+                    occupancy.fmt_duration(st.get("t", 0) - st.get("since", 0)))
+                door_pct = st.get("door")
+            render(m, shown, room_txt, occ_hist, state_hist, door_pct)
     except (KeyboardInterrupt, ConnectionError):
         pass
     finally:

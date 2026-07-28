@@ -1,33 +1,61 @@
-"""Room occupancy engine: UNKNOWN / EMPTY / OCCUPIED on top of the posture
-stack (docs/occupancy-design.md). Consumes engine.Update per frame; never
-touches sensing, orientation, zones, or the posture classifier.
+"""Room occupancy: is anyone in the bathroom.
 
-Rules (operator semantics):
-- The door is the only exit. A body vanishing off the left FOV edge
-  (sink/tub/shower) or mid-field stays OCCUPIED.
-- Exits are deltas: bodies leaving cannot be counted, so ANY door-side vanish
-  marks the room EMPTY, from any state. Door-side is judged in BOTH column
-  and depth (this is a ToF depth map; a body near the lens smears across
-  columns and can reach the door column at 400mm, which is not an exit).
-- The door does not move on its own: a door open% change while nobody is
-  visible, followed by stillness, is an exit that was missed visually
-  (exit behind a closing door, or a door left ajar).
-- Entries are observable: a door-side appear that penetrates into the field
-  while already OCCUPIED increments the occupant count.
-- Boot and stream gaps are UNKNOWN, never EMPTY; only an observed exit (or a
-  confirmed entry after quiet) leaves UNKNOWN.
-- Anti-latch: presence that never amounts to a real entry (hallway shimmer,
-  a vanish before T_CONFIRM without door penetration) decays back to EMPTY so
-  the EMPTY->OCCUPIED edge re-arms.
+Two inputs, and both of them measure a BODY:
 
-Internally there is a MAYBE phase (body evidence not yet confirmed); it is
-reported externally as OCCUPIED so consumers react instantly, but it can
-decay (ENTRY_ABORTED). Events: ENTRY_CONFIRMED, ENTRY_ABORTED, EXIT,
-GAP_RESET.
+  bathroom/posture3d.py    is there a body in the field
+  bathroom/threshold.py  did a body cross the door plane, and which way
+
+That is the whole model.
+
+  a body is in the field                -> OCCUPIED. Seeing someone is direct
+                                           evidence that someone is there.
+  a body crossed the plane outward      -> EMPTY. The door is the only way out.
+  a body crossed the plane inward       -> OCCUPIED.
+  the view is BLOCKED                   -> HOLD, and say so. Something over the
+                                           sensor (a towel, a coat on the hook,
+                                           a hand) kills the returns across the
+                                           whole field. That frame is not
+                                           evidence of anything, least of all
+                                           of an empty room, so nothing is
+                                           decided off it.
+  the field is empty, nothing crossed   -> HOLD. THE FIELD IS NOT THE ROOM. It
+                                           does not cover the sink or the tub,
+                                           so a body that walks out of the
+                                           FIELD, off to the left, has not left
+                                           the ROOM. Only a crossing empties it.
+
+WHAT THIS REPLACES, AND WHY IT WAS WRONG
+
+The previous engine reduced each frame to {interior_body, doorway_body} with
+scene.read_frame and ran a doorway automaton over that. Three things were
+broken at once, and each one hid the others:
+
+- INTERIOR PRESENCE COULD NOT LATCH OCCUPANCY. A body seen in the room with no
+  observed entry was reported as PRESENCE_NO_ENTRY and the room stayed UNKNOWN.
+  So the operator sat on the toilet in full view of the sensor and the room
+  line read `UNKNOWN(0) 8m31s`. UNKNOWN is not the cautious answer when a
+  person is visibly sitting there, it is a wrong one that declines to commit.
+
+- interior_body COULD NOT SEE A SEATED BODY. It wanted 7 cells reading 300mm
+  nearer than the empty room, and a seated body is mostly a HOLE: the beam goes
+  out where the scan found a surface and nothing comes back. posture.py counts
+  those, so this does too, by asking posture.py.
+
+- ENTRY AND EXIT WERE INFERRED FROM THE DOOR. Doorway-band cells followed by
+  interior cells meant ENTERED. This door opens outward, the sensor looks
+  straight through the frame into the hallway, and it can be opened and shut
+  from the hallway by someone who never comes in, so the panel is not a proxy
+  for a person. It is a body crossing a fixed plane now: the sign of its
+  distance to a plane derived from the scan, confirmed by travel across it.
+
+UNKNOWN survives for one thing only: before anything has been observed, and
+after a stream gap long enough that nothing about the room can be attested. It
+is never used to avoid committing to what the sensor can plainly see.
 """
-from collections import deque
-
-from .zones import State
+from . import roomscan, threshold
+from .engine import StateEngine
+from .scene import Params as SceneParams
+from .zones import N, NO_TARGET, State
 
 
 class RoomState:
@@ -36,62 +64,75 @@ class RoomState:
     OCCUPIED = "OCCUPIED"
 
 
+BLOCKED_FRACTION = 0.5   # more than half the rays the scan answers coming back
+                         # dead is not an empty room, it is a blocked view
+
+
 class Params:
-    T_CONFIRM = 2.0      # presence needed to confirm occupancy without penetration
-    T_DECAY = 0.7        # quiet time before an unconfirmed MAYBE aborts
-    T_ABSENT = 0.5       # sustained absence that ends a presence run (a vanish)
-    T_GAP = 5.0          # stream gap that forces UNKNOWN
-    K = 3                # centroid smoothing window (frames)
-    L = 4                # trailing track points used for the vanish side
-    DOOR_COL = 5.0       # smoothed centroid at/right of this is door-side
-    FIELD_COL = 4.0      # centroid at/left of this is real field penetration
-    LEFT_COL = 1.0       # centroid at/left of this is the left FOV edge
-    D_DRIFT = 0.5        # cols of trailing drift that biases the vanish side
-    # depth (this is a ToF depth map; the sensor is ~45 deg to the door, so
-    # the approach to the door is a depth gradient, not just a column):
-    DOOR_PLANE_MM = 900  # a body must have receded at least this far for a
-                         # vanish to be a door exit. A body 400-500mm from the
-                         # lens smears across columns (angular projection) and
-                         # can reach the door COLUMN while standing mid-room;
-                         # its depth exposes that. Unknown depth = permissive.
-    DOOR_MOVE_PCT = 20.0 # door open% change (vs when the body vanished) that
-                         # counts as "someone operated the door"
-    DOOR_MOVE_N = 3      # consecutive empty-field frames the change must hold
-    T_DOOR_STILL = 2.0   # stillness after the door moved before EXIT fires
+    T_GAP = 5.0  # stream silence that forces UNKNOWN (and a fresh reading)
 
 
 class RoomUpdate:
-    __slots__ = ("room", "occupants", "event", "since")
+    __slots__ = ("room", "occupants", "event", "since", "blocked")
 
-    def __init__(self, room, occupants, event, since):
+    def __init__(self, room, occupants, event, since, blocked=False):
         self.room = room            # externally reported RoomState.*
         self.occupants = occupants  # 0 unless OCCUPIED
-        self.event = event          # ENTRY_CONFIRMED/ENTRY_ABORTED/EXIT/GAP_RESET/None
+        self.event = event          # ENTRY_CONFIRMED/EXIT/PRESENCE/GAP_RESET
         self.since = since          # t when the reported room state last changed
+        self.blocked = blocked      # the view is occluded NOW (level, not edge)
 
 
 class OccupancyEngine:
-    def __init__(self):
+    """Feed it oriented frames; it says whether the room is occupied."""
+
+    def __init__(self, baseline=None):
+        # The washlet daemon constructs this with no argument. That is fine: it
+        # loads the same scan every other entrypoint loads. config.load_baseline
+        # RAISES on a missing or corrupt scan rather than substituting one, so
+        # this is not the old silent fallback to DEFAULT_BASELINE that had the
+        # room engine measuring a pre-move pose while posture used the real one.
+        if baseline is None:
+            from . import config
+            baseline = config.load_baseline()
+        # required, never defaulted. It used to default to None, which
+        # scene.read_frame resolved to classify.DEFAULT_BASELINE, and BOTH live
+        # front-ends constructed this with no argument: the room engine ran
+        # against a pre-move scan (wrong by up to 514mm on the fixture's own
+        # cells) while the posture path used the real one. Nothing reported it,
+        # because a wrong baseline yields plausible states.
+        self.baseline = baseline
+        self._scene = roomscan.Scene(baseline)
+        self._crossing = threshold.Crossing()
+        # the DEBOUNCED posture, not the raw per-frame verdict. A handful of
+        # frames of an empty room read as a body (5 of 111 in the walk-through
+        # capture), and latching occupancy off one of those put the room back
+        # to OCCUPIED a second after the operator had walked out. The temporal
+        # engine already exists to absorb exactly that; occupancy had been
+        # re-deciding per frame beside it.
+        self._posture = StateEngine(baseline=baseline)
+        self._blocked_run = 0
+        self._blocked_said = False
+        # when the last outward crossing happened. A body walking OUT through
+        # the plane is still a body in the field on those same frames, so
+        # PRESENCE re-latched OCCUPIED one frame after the EXIT and the room
+        # said occupied with the bathroom empty. Observed live at 13:38:12:
+        #   room -> EMPTY     (EXIT)
+        #   room -> OCCUPIED  (PRESENCE)
+        # After a crossing out, presence has to see the field go clear before it
+        # may latch again.
+        self._exited_at = None
+        self._clear_since_exit = False
+        # how many rays the SCAN itself answered. A ray it could not answer
+        # (the whole door column, with the door open when the scan was taken)
+        # says nothing about the view being blocked either, so the blocked test
+        # is a fraction of these rather than an absolute count out of 64.
+        self._answerable = sum(1 for r in range(N) for c in range(N)
+                               if baseline[r][c] < NO_TARGET)
         self.room = RoomState.UNKNOWN
         self.occupants = 0
         self.since = 0.0
         self._last_t = None
-        self._maybe = False          # OCCUPIED reported but entry not confirmed
-        self._cent = deque(maxlen=Params.K)   # raw centroid cols, current run
-        self._depth = deque(maxlen=Params.K)  # raw body depths (mm), current run
-        self._track = []             # (t, smoothed_col, smoothed_mm) per frame
-        self._run_start = None
-        self._run_presence = 0.0     # accumulated presence in the MAYBE episode
-        self._appear_door = False
-        self._counted = False        # this run already incremented occupants
-        self._absent_since = None
-        self._abort_at = None
-        # door-motion exit tracking (door operated while nobody is visible)
-        self._vanish_pct = None      # door open% when the field went empty
-        self._door_moved_n = 0       # consecutive frames the pct change held
-        self._door_moved_at = None   # t when the door movement was confirmed
-
-    # ---- helpers ---------------------------------------------------------
 
     def _set_room(self, room, occupants, t):
         if room != self.room:
@@ -99,154 +140,75 @@ class OccupancyEngine:
         self.room = room
         self.occupants = occupants
 
-    def _end_run(self):
-        self._cent.clear()
-        self._depth.clear()
-        self._track = []
-        self._run_start = None
-        self._appear_door = False
-        self._counted = False
-        self._absent_since = None
-
-    def _vanish_door_side(self):
-        """Door-side vanish: trailing centroid at the door band (or one column
-        short while drifting doorward), AND depth consistent with the door
-        plane. A body near the lens smears across columns and can reach the
-        door column at 400-500mm; a real exit has receded to ~the door plane
-        (>= DOOR_PLANE_MM) by the time it vanishes."""
-        if not self._track:
-            return False
-        tail = self._track[-Params.L:]
-        end = sum(p[1] for p in tail) / len(tail)
-        drift = tail[-1][1] - tail[0][1]
-        col_ok = (end >= Params.DOOR_COL
-                  or (end >= Params.DOOR_COL - 1.0 and drift >= Params.D_DRIFT))
-        if not col_ok:
-            return False
-        depths = [p[2] for p in tail if p[2] is not None]
-        if not depths:
-            return True  # no depth info: legacy column-only behavior
-        end_mm = sum(depths) / len(depths)
-        return end_mm >= Params.DOOR_PLANE_MM
-
-    # ---- one step --------------------------------------------------------
-
-    def update(self, u, t, door_pct=None):
-        """u: engine.Update (only .instant and .features are read).
-        door_pct: current door open% (detect.door_open_pct), used for the
-        door-motion exit rule; None disables that rule for this step."""
+    def update(self, frame, t, door_pct=None, crossed_out=False):
+        """One frame. Accepts either an oriented 8x8 matrix or an engine.Update
+        (the washlet daemon passes the latter), so the daemon's call site is
+        unchanged. `door_pct` is accepted and ignored: the panel is telemetry,
+        operated from both sides and obscured by whoever operates it, and it
+        never decides occupancy. `crossed_out` is likewise accepted and ignored:
+        the door-plane crossing is computed here now, from the frame, instead of
+        being computed twice and passed back in."""
+        matrix = getattr(frame, "matrix", frame)
         event = None
-
         if self._last_t is not None and t - self._last_t > Params.T_GAP:
+            # unobserved stretch: nothing about the room can be attested
             self._set_room(RoomState.UNKNOWN, 0, t)
-            self._maybe = False
-            self._abort_at = None
-            self._vanish_pct = None
-            self._door_moved_at = None
-            self._door_moved_n = 0
-            self._end_run()
+            # the crossing history AND the posture debounce are both stale: a
+            # body committed before the gap is not evidence of a body after it,
+            # and holding that history reported the pre-gap occupant on the
+            # first frame back.
+            self._crossing = threshold.Crossing()
+            self._posture = StateEngine(baseline=self.baseline)
             event = "GAP_RESET"
         self._last_t = t
 
-        cells = u.features["occ_cells"]
-        present = u.instant != State.EMPTY and bool(cells)
+        # A BLOCKED VIEW IS NOT AN OBSERVATION. The empty room answers on
+        # essentially every ray, so a frame that answers almost nowhere is not
+        # an empty room, it is something over the sensor. Decide nothing from
+        # it: no crossing, no posture, no state change. Say it once per run.
+        dead = sum(1 for r in range(N) for c in range(N)
+                   if matrix[r][c] >= NO_TARGET
+                   and self.baseline[r][c] < NO_TARGET)
+        if self._answerable and dead > BLOCKED_FRACTION * self._answerable:
+            self._blocked_run += 1
+            debounced = self._blocked_run > SceneParams.DEBOUNCE_N
+            if debounced and not self._blocked_said:
+                self._blocked_said = True
+                event = event or "OCCLUDED"
+            return RoomUpdate(self.room, self.occupants, event, self.since,
+                              blocked=debounced)
+        self._blocked_run = 0
+        self._blocked_said = False
 
-        if present:
-            self._abort_at = None
-            self._vanish_pct = None       # body visible again: door-motion moot
-            self._door_moved_at = None
-            self._door_moved_n = 0
-            self._cent.append(sum(c for _r, c in cells) / float(len(cells)))
-            smoothed = sum(self._cent) / len(self._cent)
-            body_mm = u.features.get("body_mm")
-            if body_mm is not None:
-                self._depth.append(body_mm)
-            smoothed_mm = (sum(self._depth) / len(self._depth)
-                           if self._depth else None)
-            if self._run_start is None:
-                self._run_start = t
-                self._appear_door = smoothed >= Params.DOOR_COL
-            self._absent_since = None
-            self._track.append((t, smoothed, smoothed_mm))
-            run_len = t - self._run_start
+        crossed = self._crossing.update(matrix, self._scene, t)
+        if crossed == threshold.EXIT:
+            # exits are deltas and cannot be attributed, so the count zeroes
+            self._set_room(RoomState.EMPTY, 0, t)
+            self._exited_at = t
+            self._clear_since_exit = False
+            return RoomUpdate(self.room, self.occupants, "EXIT", self.since)
+        if crossed == threshold.ENTRY:
+            n = self.occupants + 1 if self.room == RoomState.OCCUPIED else 1
+            self._set_room(RoomState.OCCUPIED, n, t)
+            return RoomUpdate(self.room, self.occupants, "ENTRY_CONFIRMED",
+                              self.since)
 
-            if self.room == RoomState.EMPTY:
-                # evidence: report OCCUPIED immediately, confirm below
-                self._maybe = True
-                self._run_presence = 0.0
+        state = self._posture.update(matrix, t).committed
+        if state == State.EMPTY:
+            self._clear_since_exit = True
+        if state != State.EMPTY:
+            # a body is in the field. That is the whole argument, EXCEPT
+            # immediately after an outward crossing: the departing body is still
+            # in the field on those frames, and re-latching off it is how the
+            # room ended up occupied with nobody in it.
+            if self._exited_at is not None and not self._clear_since_exit:
+                return RoomUpdate(self.room, self.occupants, event, self.since)
+            if self.room != RoomState.OCCUPIED:
                 self._set_room(RoomState.OCCUPIED, 1, t)
+                event = "PRESENCE"
+            return RoomUpdate(self.room, self.occupants, event, self.since)
 
-            penetrated = self._appear_door and smoothed <= Params.FIELD_COL
-            if self._maybe and (penetrated
-                                or self._run_presence + run_len >= Params.T_CONFIRM):
-                self._maybe = False
-                self._counted = True
-                event = "ENTRY_CONFIRMED"
-            elif self.room == RoomState.UNKNOWN and run_len >= Params.T_CONFIRM:
-                # present since boot: they never "entered", but they are here
-                self._set_room(RoomState.OCCUPIED, 1, t)
-                self._counted = True
-                event = "ENTRY_CONFIRMED"
-            elif (self.room == RoomState.OCCUPIED and not self._maybe
-                    and not self._counted and penetrated):
-                # a new door-side appear that came into the field = +1 entry
-                self._counted = True
-                self.occupants += 1
-                event = "ENTRY_CONFIRMED"
-        else:
-            if self._run_start is not None:
-                if self._absent_since is None:
-                    self._absent_since = t
-                elif t - self._absent_since >= Params.T_ABSENT:
-                    # the run is over: a vanish
-                    door_side = self._vanish_door_side()
-                    run_len = self._absent_since - self._run_start
-                    self._end_run()
-                    if door_side:
-                        # ANY observed exit empties the room (delta-only rule)
-                        self._maybe = False
-                        self._set_room(RoomState.EMPTY, 0, t)
-                        event = "EXIT"
-                    else:
-                        if self._maybe:
-                            # unconfirmed body gone off-side: arm the anti-latch
-                            self._run_presence += run_len
-                            self._abort_at = t + Params.T_DECAY
-                        # off-side vanish while occupied: remember the door
-                        # state so a later door movement (with nobody visible)
-                        # can be read as the exit we missed
-                        if door_pct is not None:
-                            self._vanish_pct = door_pct
-            if (self._abort_at is not None and t >= self._abort_at
-                    and self._maybe):
-                self._maybe = False
-                self._abort_at = None
-                self._set_room(RoomState.EMPTY, 0, t)
-                event = "ENTRY_ABORTED"
-            # door-motion exit: the door does not move on its own. If the
-            # field is empty, we are OCCUPIED, and the door open% has changed
-            # since the body vanished and stayed changed, whoever moved it
-            # left through it. After T_DOOR_STILL of continued emptiness,
-            # that is the exit (covers exit-behind-a-closing-door and the
-            # door-left-ajar case). A body out of FOV left (shower) never
-            # trips this: the door state does not change.
-            if (event is None and self.room == RoomState.OCCUPIED
-                    and door_pct is not None and self._vanish_pct is not None):
-                if self._door_moved_at is None:
-                    if abs(door_pct - self._vanish_pct) >= Params.DOOR_MOVE_PCT:
-                        self._door_moved_n += 1
-                        if self._door_moved_n >= Params.DOOR_MOVE_N:
-                            self._door_moved_at = t
-                    else:
-                        self._door_moved_n = 0
-                elif t - self._door_moved_at >= Params.T_DOOR_STILL:
-                    self._maybe = False
-                    self._vanish_pct = None
-                    self._door_moved_at = None
-                    self._door_moved_n = 0
-                    self._set_room(RoomState.EMPTY, 0, t)
-                    event = "EXIT"
-
+        # The field is empty, which is NOT an empty room. Hold what it was.
         return RoomUpdate(self.room, self.occupants, event, self.since)
 
 

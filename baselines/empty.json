@@ -1,16 +1,1 @@
-{
- "captured": 1782782117,
- "frames": 8,
- "source": "labeled door-CLOSED capture from ~/snapshots/labeled.jsonl (clean empty room)",
- "orientation": "display: rotate_cw -> flip_x -> flip_y; row0=top, col0=column A",
- "matrix": [
-  [1115, 1185, 1290, 1400, 1318, 1163, 1155, 1044],
-  [1210, 1343, 1453, 1496, 1303, 1155, 1152, 1050],
-  [1342, 1496, 1641, 1516, 1285, 1159, 1150, 1059],
-  [1392, 1626, 1734, 1513, 1290, 1168, 1154, 1060],
-  [1297, 1444, 1701, 1488, 1302, 1158, 1145, 1066],
-  [1266, 1342, 4000, 1535, 1292, 1143, 1149, 1048],
-  [1335, 973, 966, 1497, 1266, 1153, 1130, 1055],
-  [1342, 967, 943, 1402, 1291, 1131, 1129, 1045]
- ]
-}
+{"captured": 1784961595.98, "frames": 44, "orientation": "display: rotate_cw -> flip_x -> flip_y; row0=top, col0=column A", "matrix": [[1104, 1179, 1267, 1382, 1403, 1220, 1143, 4000], [1207, 1311, 1438, 1546, 1428, 1215, 1124, 4000], [1325, 1464, 1638, 1656, 1437, 1224, 1121, 4000], [1366, 1541, 1707, 1673, 1403, 1231, 1116, 4000], [1348, 1359, 1700, 1635, 1402, 1235, 1113, 4000], [1347, 1308, 4000, 1616, 1401, 1230, 1119, 4000], [1351, 1078, 973, 989, 1397, 1221, 1108, 4000], [1233, 1195, 999, 1060, 1379, 1199, 1109, 4000]], "noise_floor": [[1063, 1145, 1246, 1345, 1337, 833, 710, 680], [1148, 1274, 1389, 1483, 1290, 862, 735, 615], [1296, 1382, 1529, 1437, 1311, 892, 698, 625], [1343, 1238, 1083, 1461, 1311, 870, 731, 639], [1286, 1177, 1229, 1509, 1300, 1078, 781, 448], [1258, 1229, 1351, 1446, 1298, 1145, 967, 614], [1319, 991, 902, 922, 1300, 1141, 950, 653], [1081, 1016, 946, 943, 1278, 1127, 749, 560]], "noise_floor_source": "The nearest each cell was EVER observed to read across 161 operator-attested EMPTY frames. A return nearer than this is a body; a return between this and the median is the empty room's own spread. A flat 250mm cut sits INSIDE that spread on 42 of 55 cells: at A1 the flat cut is 854mm but the empty room never came nearer than 1063mm, and at C4 it is 1423mm against 1461mm. That is why an empty bathroom intermittently built a body-sized shape and committed STANDING_AT_TOILET."}

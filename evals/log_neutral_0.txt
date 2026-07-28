@@ -1,0 +1,2 @@
+stub pi on 127.0.0.1:49965, 573 frames, loop=True
+Failed to authenticate: OAuth session expired and could not be refreshed

@@ -1,5 +1,17 @@
 """Report committed transitions to the Pi's in-memory transition archive.
 
+ONLY THE DAEMON MARKS. This used to be constructed by heatmap_client.py and
+bathroom/live.py as well, so every viewer left running wrote its own committed
+transitions into the same 255-entry ring the washlet daemon writes to, with
+nothing in the mark saying who sent it. The marks interleave, and the only way
+to tell them apart afterwards is that each client's `t` is its own uptime: a
+viewer running since Thursday stamped t=223111 next to the daemon's t=97, in
+the same session, describing the same 25 seconds of one person using the
+bathroom. The archive then disagreed with the daemon's own log and the
+disagreement looked like a detection bug.
+
+A viewer observes. It does not write to the system's event history.
+
 The engines already track every transition; this only forwards them. Each
 committed posture transition and each room-state change is sent as one
 "MARK <json>" line back over the live stream socket (stream.send). The server
