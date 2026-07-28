@@ -84,6 +84,19 @@ SEAT_ADVANCE_MIN = 1
 # down, and it reads STANDING, not UNKNOWN. A body the sensor can plainly see is
 # never UNKNOWN: that was the whole complaint this file exists to answer.
 UPRIGHT_CELLS = 24
+# THE TOILET DOES NOT MOVE, so neither does where a seated body can be. A sit
+# is AT the seat: over 288 attested sitting frames the body's median return is
+# never more than 338mm in front of the fixture's own scanned distance (p95 is
+# 201mm, the torso leaning forward). The sitting branch never asked. A body
+# crossing 8 inches from the lens read 703-731mm in front of the seat, kept its
+# top row out of frame, occluded the seat's rays (which is what seat_advance
+# measures: rays answered early, whether by a body on the seat or a body in
+# front of it), came in under UPRIGHT_CELLS, and committed SITTING; the play
+# latch was spent on someone leaning at the sensor. 450mm keeps every attested
+# sit with 112mm to spare and excludes that frame by 250mm. A low small shape
+# further out than this is a body in front of the lens, and falls through to
+# the upright branches, where LENS_MM already reads it as WALKING.
+SIT_MAX_FRONT_MM = 450
 BLOCKED_FRACTION = 0.5  # more than half the rays THE SCAN ANSWERS coming back
                         # dead is not a body, it is something over the sensor.
                         # The largest attested body leaves 12 rays dead; a
@@ -265,9 +278,15 @@ def classify(matrix, baseline):
 
     # Low AND small AND on the seat: sitting. Small matters because a standing
     # body that merely blinks its top row is still standing-sized (see
-    # UPRIGHT_CELLS), and it must not read as a sit.
+    # UPRIGHT_CELLS), and it must not read as a sit. AT the seat matters
+    # because seat_advance cannot tell a body on the fixture from a body
+    # between the lens and the fixture: both answer the seat's rays early
+    # (see SIT_MAX_FRONT_MM). No distance evidence (body_mm None: a torso of
+    # pure no-returns) does not veto the sit.
     if (not f["touches_top"] and f["body_cells"] < UPRIGHT_CELLS
-            and f["seat_advance"] >= SEAT_ADVANCE_MIN):
+            and f["seat_advance"] >= SEAT_ADVANCE_MIN
+            and (f["body_mm"] is None or f["seat_mm"] is None
+                 or f["seat_mm"] - f["body_mm"] <= SIT_MAX_FRONT_MM)):
         return State.SITTING_AT_TOILET, f
 
     # Everything else the sensor can see is an upright body: at the lens, or at
