@@ -108,14 +108,24 @@ def main():
             trs = _normalize(s)
             t0 = time.strftime("%H:%M:%S", time.localtime(trs[0]["ts"]))
             t1 = time.strftime("%H:%M:%S", time.localtime(trs[-1]["ts"]))
-            print("session %-3d %s - %s  %d transitions" % (s["id"], t0, t1, len(trs)))
+            # id 0 is the between-sessions bucket: marks that carry no
+            # occupancy (an ir press at an empty room), persisted by the
+            # server as orphan records rather than sessions
+            name = ("orphan     " if s.get("orphan") or s["id"] == 0
+                    else "session %-3d" % s["id"])
+            print("%s %s - %s  %d transitions" % (name, t0, t1, len(trs)))
         return 0
 
-    for s in sessions:
-        if s["id"] != a.session:
-            continue
+    # several orphan groups can share id 0, so replay every group with the
+    # requested id rather than stopping at the first
+    picked = [s for s in sessions if s["id"] == a.session]
+    if not picked:
+        print("no session %d in the archive" % a.session)
+        return 1
+    for s in picked:
         trs = sorted(_normalize(s), key=lambda tr: tr["ts"])
-        print("session %d  (%d transitions)\n" % (s["id"], len(trs)))
+        name = "orphan" if s.get("orphan") or s["id"] == 0 else "session %d" % s["id"]
+        print("%s  (%d transitions)\n" % (name, len(trs)))
         for tr in trs:
             print(_label(tr))
             if tr["frame"]:
@@ -123,9 +133,7 @@ def main():
             print()
             if a.delay:
                 time.sleep(a.delay)
-        return 0
-    print("no session %d in the archive" % a.session)
-    return 1
+    return 0
 
 
 if __name__ == "__main__":
