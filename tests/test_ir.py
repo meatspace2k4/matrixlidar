@@ -88,11 +88,71 @@ def main():
     asm = ir.FrameAssembler()
     fps = asm.feed(w(ir.MODE2_SPACE, 0xFFFFFF) + frame(BUTTON_A))
     check(fps == [fp_a], "leading idle space is not a frame")
-    check(ir.FrameAssembler().feed(
+    glitch = ir.FrameAssembler().feed(
         w(ir.MODE2_PULSE, 560) + w(ir.MODE2_SPACE, 560)
-        + w(ir.MODE2_PULSE, 560) + w(ir.MODE2_TIMEOUT, 22000)) == [],
-        "a sub-8-bit glitch fingerprints as nothing")
+        + w(ir.MODE2_PULSE, 560) + w(ir.MODE2_TIMEOUT, 22000))
+    check(glitch == ["1:0"] and not ir.is_expected_length(glitch[0]),
+          "a 1-bit glitch is captured and fails the length gate")
     n += 2
+
+    # --- capture keeps everything; the gate is applied when READING ---------
+    # Every short frame seen on the real receiver, by bit count. These are the
+    # receiver's LED feeding back into its own photodiode and chopping up a
+    # real press, and they are RECORDED: their rate is the diagnostic for that
+    # coupling, and a capture-time filter cannot be un-applied.
+    junk_bits = (8, 10, 12, 13, 15, 16, 19, 21, 22, 28, 30, 31, 35)
+    junk = b"".join(frame("1" * b) for b in junk_bits)
+    fps = ir.FrameAssembler().feed(junk)
+    check(len(fps) == 13, "every wrong-length burst is still captured")
+    check([ir.fp_bits(f) for f in fps] == list(junk_bits),
+          "and captured at its real length, not normalized")
+    n += 2
+
+    # ... and none of them passes the length gate when read
+    check([f for f in fps if ir.is_expected_length(f)] == [],
+          "no short frame passes the length gate")
+    check(ir.is_expected_length(fp_a) and ir.is_expected_length({"fp": fp_a}),
+          "a 40-bit frame passes, dict or bare string")
+    n += 2
+
+    # the gate must not cost a real press: same stream, remote frame appended
+    fps = ir.FrameAssembler().feed(junk + frame(BUTTON_A))
+    check([f for f in fps if ir.is_expected_length(f)] == [fp_a],
+          "a real 40-bit press survives a burst of LED feedback")
+    check(len(fps) == 14, "and the fragments are in the log alongside it")
+    n += 2
+
+    # want_bits=0 passes everything, for an unknown remote
+    check([f for f in fps if ir.is_expected_length(f, want_bits=0)] == fps,
+          "want_bits=0 passes every frame length")
+    n += 1
+
+    # the length is the gate, not the content: a 40-bit frame of all zeros
+    # still passes
+    zeros = ir.FrameAssembler().feed(frame("0" * 40))
+    check(zeros == ["40:" + "0" * 10] and ir.is_expected_length(zeros[0]),
+          "a 40-bit all-zero frame passes (length gates, content does not)")
+    n += 1
+
+    # --- a bad WASHLET_IR_BITS must not take the recorder down --------------
+    # An unguarded int() here crashed record._open_receiver, whose entire job
+    # is to not crash when the IR setup is broken.
+    old = os.environ.get("WASHLET_IR_BITS")
+    try:
+        os.environ["WASHLET_IR_BITS"] = "auto"
+        check(ir._want_bits() == ir.FRAME_BITS,
+              "WASHLET_IR_BITS=auto falls back instead of raising")
+        rx = ir.Receiver(device="/nonexistent/lirc99")
+        check(rx.start() is False, "and a Receiver still constructs and fails soft")
+        os.environ["WASHLET_IR_BITS"] = "0"
+        check(ir._want_bits() == 0, "WASHLET_IR_BITS=0 is honoured, not falsy-defaulted")
+        os.environ["WASHLET_IR_BITS"] = "-3"
+        check(ir._want_bits() == ir.FRAME_BITS, "a negative width falls back")
+    finally:
+        os.environ.pop("WASHLET_IR_BITS", None)
+        if old is not None:
+            os.environ["WASHLET_IR_BITS"] = old
+    n += 4
 
     # --- discovery walks /sys/class/rc and rejects CEC ----------------------
     with tempfile.TemporaryDirectory() as d:

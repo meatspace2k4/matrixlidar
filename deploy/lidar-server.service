@@ -1,0 +1,68 @@
+# DFRobot matrix lidar server. Runs as `lidar`, a nologin system account.
+#
+# Install: deploy/migrate-to-service-accounts.sh (as root)
+# Logs:    journalctl -u lidar-server -f
+#
+# NOT `After=multi-user.target`. That line was here once and it is what
+# deleted washlet's start job at every boot: washlet is After= this unit,
+# this unit was After= the target, and the target Wants= washlet. systemd
+# broke the cycle by dropping washlet, so the daemon only ever ran when
+# started by hand. A unit that is WantedBy= a target must not also be
+# ordered after it.
+[Unit]
+Description=DFRobot matrix lidar server (always-on sensor read + TCP broadcast)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/washlet/lidar_server.py
+User=lidar
+Group=lidar
+SupplementaryGroups=dialout
+Restart=always
+RestartSec=2
+
+Environment=LIDAR_MODE=uart
+Environment=LIDAR_PORT=/dev/serial0
+Environment=LIDAR_BAUD=115200
+# Was /home/jpark/lidar_sessions.jsonl. StateDirectory creates and chowns
+# this to the service user, so the unit needs no writable path in /home and
+# ProtectHome below can be absolute.
+Environment=LIDAR_LOG=/var/lib/lidar-server/sessions.jsonl
+StateDirectory=lidar-server
+StateDirectoryMode=0750
+
+# --- containment -------------------------------------------------------
+# This process parses newline JSON from any client on the LAN. It gets the
+# serial port and a listening socket and nothing else.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# The serial port only. /dev/serial0 is a symlink; DeviceAllow needs the
+# node it resolves to.
+DevicePolicy=closed
+DeviceAllow=/dev/ttyAMA0 rw
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

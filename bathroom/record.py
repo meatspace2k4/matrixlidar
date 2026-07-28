@@ -114,15 +114,40 @@ def _capture(seconds, on_frame, start=None):
 
 
 def _ir_fingerprints(ir_log):
-    """{fingerprint: count} over a clip's IR log.
+    """{fingerprint: count} over the BUTTON frames in a clip's IR log.
 
     The fingerprints are the summary worth having: which buttons were talking
     during this capture, and how much. Counts every frame including repeats,
     because the per-event `repeat` flag is right there in the log for anyone
     who wants presses instead.
+
+    Short frames are excluded HERE, at read time, and only here. The `ir` log
+    itself keeps every frame that arrived (see bathroom/ir.py FRAME_BITS):
+    this summary is a view of it, so a gate that turns out to be wrong costs
+    a re-read rather than the data.
     """
     counts = {}
     for ev in ir_log:
+        if not ir_mod.is_expected_length(ev):
+            continue
+        k = ev.get("fp", "?")
+        counts[k] = counts.get(k, 0) + 1
+    return counts
+
+
+def _ir_fragments(ir_log):
+    """{fingerprint: count} over the short frames the gate excludes.
+
+    These are the receiver's own LED coupling back into its photodiode and
+    breaking up a real press (see bathroom/ir.py FRAME_BITS), so their rate
+    measures how bad that coupling is on this board. Kept as its own field
+    rather than a single number: a clean run and a badly coupled one both
+    summarize to the same button list, and this is what separates them.
+    """
+    counts = {}
+    for ev in ir_log:
+        if ir_mod.is_expected_length(ev):
+            continue
         k = ev.get("fp", "?")
         counts[k] = counts.get(k, 0) + 1
     return counts
@@ -214,8 +239,10 @@ def record_clip(label, seconds, notes=None):
         "timeline": eng.segments(),     # debounced state segments over the clip
         "notes": notes,
         "ir_source": ir_source,         # which receiver, or why there was none
-        "ir_fingerprints": _ir_fingerprints(ir_log),  # {fp: count}, at a glance
-        "ir": ir_log,                   # every decoded frame, in arrival order
+        "ir_fingerprints": _ir_fingerprints(ir_log),  # {fp: count} buttons
+        "ir_fragments": _ir_fragments(ir_log),  # {fp: count} LED-feedback shorts
+        "ir": ir_log,                   # EVERY frame that arrived, gated by
+                                        # nothing, in arrival order
         "frames": frames,
     }
     path = "%s/%s.json" % (config.CLIPS_DIR, clip_id)
@@ -229,6 +256,7 @@ def record_clip(label, seconds, notes=None):
                 "hz": doc["hz"], "started": doc["started"],
                 "auto_state_counts": auto_counts, "file": path, "notes": notes,
                 "ir_n": len(ir_log), "ir_fingerprints": doc["ir_fingerprints"],
+                "ir_fragments_n": sum(doc["ir_fragments"].values()),
             }) + "\n")
     except OSError as e:
         sys.stderr.write("warning: clip saved but manifest update failed: %s\n" % e)
@@ -238,10 +266,15 @@ def record_clip(label, seconds, notes=None):
     sys.stderr.write("auto-state mix: %s\n"
                      % ", ".join("%s=%d" % kv for kv in sorted(auto_counts.items())))
     if ir_log:
-        sys.stderr.write("ir: %d signals: %s\n"
+        amb = sum(doc["ir_fragments"].values())
+        sys.stderr.write("ir: %d frames recorded; %d buttons: %s%s\n"
                          % (len(ir_log),
+                            sum(doc["ir_fingerprints"].values()),
                             ", ".join("%s x%d" % kv
-                                      for kv in sorted(doc["ir_fingerprints"].items()))))
+                                      for kv in sorted(doc["ir_fingerprints"].items()))
+                            or "(none)",
+                            "; %d fragments (in the log, not counted)" % amb
+                            if amb else ""))
     else:
         sys.stderr.write("ir: none (%s)\n" % ir_mod.describe(ir_source))
     return 0

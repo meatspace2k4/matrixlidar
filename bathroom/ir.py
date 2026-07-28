@@ -34,6 +34,7 @@ instead of carrying an empty lie.
 """
 import os
 import struct
+import sys
 import threading
 import time
 
@@ -50,7 +51,30 @@ FRAME_GAP_US = 10000   # a space this long ends a frame. Frames within a held
                        # out ~1.7ms. An order of magnitude sits between.
 BIT_SPLIT_US = 1100    # short/long space boundary: the observed clusters are
                        # ~560us and ~1690us, this is the midpoint gap.
-MIN_FRAME_BITS = 8     # anything shorter is a glitch, not a button
+FRAME_BITS = 40        # the remote's frame. Over 60 recorded marks, 42 were
+                       # exactly 40 bits and formed 7 fingerprints that each
+                       # repeat (x12 x10 x6 x6 x4 x2 x2), all sharing an a008
+                       # prefix: 7 buttons.
+                       #
+                       # The other 18 came in 13 different lengths, each once.
+                       # They are the receiver's own LED feeding back into its
+                       # photodiode, so they arrive while a real press is being
+                       # received and are fragments of one, not a signal from
+                       # anything else. Do not describe them as ambient IR: it
+                       # is the same board talking to itself, and it will
+                       # happen on any run, indoors, in the dark, with no other
+                       # remote in the house.
+                       #
+                       # THIS GATES READING, NOT RECORDING. Every frame goes
+                       # into the clip whatever its length, and
+                       # `is_expected_length` decides on the way out. The
+                       # feedback fragments are worth keeping: their rate is
+                       # the diagnostic for how bad the coupling is, and if the
+                       # board is ever fixed a clip recorded today still shows
+                       # what it looked like before.
+                       #
+                       # WASHLET_IR_BITS=0 turns the gate off, for a remote
+                       # whose frame size is not yet known.
 
 # A held button re-sends its frame every few tens of ms. Same fingerprint
 # within this window is the button still down, not a second press. Logged
@@ -63,14 +87,61 @@ QUEUE_MAX = 4096       # an undrained receiver leaks nothing worse than this
 RC_CLASS = "/sys/class/rc"
 
 
+def _want_bits():
+    """The read-time gate width from the environment.
+
+    Garbage falls back to FRAME_BITS instead of raising. This module's
+    contract is that a broken IR setup costs you the IR log and nothing else,
+    and an unguarded int() here took the whole recorder down with a
+    ValueError: WASHLET_IR_BITS=auto crashed record._open_receiver, which is
+    the one function whose entire job is to not do that.
+    """
+    raw = os.environ.get("WASHLET_IR_BITS")
+    if raw is None:
+        return FRAME_BITS
+    try:
+        n = int(raw)
+    except ValueError:
+        sys.stderr.write("ir: WASHLET_IR_BITS=%r is not a number, using %d\n"
+                         % (raw, FRAME_BITS))
+        return FRAME_BITS
+    return n if n >= 0 else FRAME_BITS
+
+
 def fingerprint(spaces):
-    """bits:hex fingerprint from a frame's intra-frame space durations."""
-    bits = ["1" if us > BIT_SPLIT_US else "0" for us in spaces]
-    n = len(bits)
-    if n < MIN_FRAME_BITS:
+    """bits:hex fingerprint from a frame's intra-frame space durations.
+
+    Every frame gets one. Whether a frame is a BUTTON is a separate question,
+    asked by `is_expected_length` at read time; see the note on FRAME_BITS. None only
+    for a frame with no spaces at all, which is not a frame.
+    """
+    n = len(spaces)
+    if n < 1:
         return None
-    val = int("".join(bits), 2)
+    val = int("".join("1" if us > BIT_SPLIT_US else "0" for us in spaces), 2)
     return "%d:%0*x" % (n, (n + 3) // 4, val)
+
+
+def fp_bits(fp):
+    """The bit count a fingerprint states, or -1 if it states nothing sane."""
+    try:
+        return int(str(fp).split(":", 1)[0])
+    except (ValueError, AttributeError):
+        return -1
+
+
+def is_expected_length(ev, want_bits=None):
+    """Is this recorded frame the remote's full frame, or a short fragment?
+
+    The read-time gate, and it tests exactly one thing: bit count. `ev` is an
+    event dict or a bare fingerprint string. want_bits=0 (WASHLET_IR_BITS=0)
+    accepts every length, for a remote whose frame size is not yet known.
+    """
+    want = _want_bits() if want_bits is None else want_bits
+    if not want:
+        return True
+    fp = ev.get("fp") if isinstance(ev, dict) else ev
+    return fp_bits(fp) == want
 
 
 class FrameAssembler:
@@ -173,10 +244,14 @@ class Receiver:
     __slots__ = ("device", "source", "_fd", "_thread", "_q", "_stop",
                  "_asm", "_last_fp", "_last_ts")
 
-    def __init__(self, device=None):
+    def __init__(self, device=None, want_bits=None):
         # An explicit device beats discovery, and IR_DEVICE beats both.
         self.device = device or os.environ.get("IR_DEVICE") or None
-        self.source = {"device": self.device, "state": "unstarted"}
+        # Recorded so a reader knows which gate the log was READ through. It
+        # does not affect what the receiver captures: everything is captured.
+        self.source = {"device": self.device, "state": "unstarted",
+                       "want_bits": _want_bits() if want_bits is None
+                                    else want_bits}
         self._fd = None
         self._thread = None
         self._q = deque(maxlen=QUEUE_MAX)
@@ -262,15 +337,24 @@ def describe(source):
     """One line for a human: what the IR side of a recording actually was."""
     state = source.get("state")
     if state == "open":
-        return "IR %s (%s, raw fingerprinting)" % (
-            source.get("device"), source.get("name", "?"))
+        want = source.get("want_bits")
+        return "IR %s (%s, raw fingerprinting, recording every frame, %s)" % (
+            source.get("device"), source.get("name", "?"),
+            "reading %d-bit as buttons" % want if want
+            else "reading every length as a button")
     return "IR unavailable (%s): %s" % (state, source.get("reason", "-"))
 
 
 def format_event(ev):
-    """One line for a human, for the replay printer and the recorder alike."""
-    return "fp=%s%s" % (ev.get("fp", "?"),
-                        " (repeat)" if ev.get("repeat") else "")
+    """One line for a human, for the replay printer and the recorder alike.
+
+    A non-button frame is printed too, marked. It is in the log either way;
+    hiding it in the one place a human looks would put the read-time gate
+    right back where the capture-time one was.
+    """
+    return "fp=%s%s%s" % (ev.get("fp", "?"),
+                          " (repeat)" if ev.get("repeat") else "",
+                          "" if is_expected_length(ev) else " (fragment)")
 
 
 def _main():
