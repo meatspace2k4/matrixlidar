@@ -27,9 +27,9 @@ Decisions:
 
 IR is recorded, never obeyed. The daemon opens the Pi's local receiver
 (bathroom/ir.py; absent hardware is logged once and costs nothing) and every
-decoded signal is printed with its NEC address and MARKed into the session
-archive on the lidar server, where it persists with the session and comes
-back out of replay.py. Signals arriving on the stream as "IR <json>" lines
+frame FINGERPRINT is printed and MARKed into the session archive on the
+lidar server, where it persists with the session and comes back out of
+replay.py. Signals arriving on the stream as "IR <json>" lines
 (a replayed clip's recorded log) are printed the same way. Neither source
 triggers audio or touches the latch: the remote is not a control surface for
 this daemon, it is something the room heard.
@@ -482,7 +482,7 @@ def main():
                      "occ": u.features["occ_count"],
                      "dir": _direction(col_hist).strip()}))
 
-            # IR from two sources, one treatment: print with the address, mark
+            # IR from two sources, one treatment: print the fingerprint, mark
             # into the session archive, trigger nothing. The local receiver is
             # the live bathroom (this daemon runs on the Pi the sensor is wired
             # to); the stream's "IR <json>" lines are a replayed clip's

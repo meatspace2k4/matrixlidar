@@ -16,9 +16,11 @@ client alongside to watch what you are labeling; both share the warm stream.
 
 IR
 
-A clip also carries an `ir` log: every IR frame the receiver decoded during
-the capture, each with the NEC ADDRESS it was addressed to, on the same time
-axis as the lidar frames. It is a LOG, not a per-frame column -- IR arrives
+A clip also carries an `ir` log: every IR frame the receiver heard during
+the capture, each reduced to its FINGERPRINT (bathroom/ir.py; the bathroom
+remote speaks no kernel-known protocol, so raw frames are fingerprinted
+rather than decoded), on the same time axis as the lidar frames. It is a
+LOG, not a per-frame column -- IR arrives
 when a button is pressed and the lidar arrives at 10 Hz, and forcing the
 sparse one into the dense one would invent a value for every frame nobody
 pressed anything in.
@@ -111,17 +113,17 @@ def _capture(seconds, on_frame, start=None):
     return start
 
 
-def _ir_addresses(ir_log):
-    """{address_hex: count} over a clip's IR log.
+def _ir_fingerprints(ir_log):
+    """{fingerprint: count} over a clip's IR log.
 
-    The addresses are the summary worth having: which remotes were talking
+    The fingerprints are the summary worth having: which buttons were talking
     during this capture, and how much. Counts every frame including repeats,
     because the per-event `repeat` flag is right there in the log for anyone
     who wants presses instead.
     """
     counts = {}
     for ev in ir_log:
-        k = ev.get("address_hex", "0x%02X" % ev.get("address", 0))
+        k = ev.get("fp", "?")
         counts[k] = counts.get(k, 0) + 1
     return counts
 
@@ -212,7 +214,7 @@ def record_clip(label, seconds, notes=None):
         "timeline": eng.segments(),     # debounced state segments over the clip
         "notes": notes,
         "ir_source": ir_source,         # which receiver, or why there was none
-        "ir_addresses": _ir_addresses(ir_log),  # {address_hex: count}, at a glance
+        "ir_fingerprints": _ir_fingerprints(ir_log),  # {fp: count}, at a glance
         "ir": ir_log,                   # every decoded frame, in arrival order
         "frames": frames,
     }
@@ -226,7 +228,7 @@ def record_clip(label, seconds, notes=None):
                 "clip_id": clip_id, "label": label, "n": len(frames),
                 "hz": doc["hz"], "started": doc["started"],
                 "auto_state_counts": auto_counts, "file": path, "notes": notes,
-                "ir_n": len(ir_log), "ir_addresses": doc["ir_addresses"],
+                "ir_n": len(ir_log), "ir_fingerprints": doc["ir_fingerprints"],
             }) + "\n")
     except OSError as e:
         sys.stderr.write("warning: clip saved but manifest update failed: %s\n" % e)
@@ -236,10 +238,10 @@ def record_clip(label, seconds, notes=None):
     sys.stderr.write("auto-state mix: %s\n"
                      % ", ".join("%s=%d" % kv for kv in sorted(auto_counts.items())))
     if ir_log:
-        sys.stderr.write("ir: %d signals from %s\n"
+        sys.stderr.write("ir: %d signals: %s\n"
                          % (len(ir_log),
                             ", ".join("%s x%d" % kv
-                                      for kv in sorted(doc["ir_addresses"].items()))))
+                                      for kv in sorted(doc["ir_fingerprints"].items()))))
     else:
         sys.stderr.write("ir: none (%s)\n" % ir_mod.describe(ir_source))
     return 0

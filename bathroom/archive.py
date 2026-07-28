@@ -56,30 +56,28 @@ class Marker:
                         "event": None, "boundary": None})
 
     def ir(self, ev, t):
-        """Mark one decoded IR signal into the session archive.
+        """Mark one IR fingerprint into the session archive.
 
         The server's persisted log keeps only {ts,t,kind,from,to,event,
-        boundary} per mark (lidar_server._event_only), so the fields that must
-        survive a power cycle are packed into that shape: the ADDRESS in
-        `from`, the command in `to`, the scancode (with a repeat tag) in
-        `event`. The full decode rides alongside for the RAM ring, which
-        stores the mark verbatim.
+        boundary} per mark (lidar_server._event_only), so the one field that
+        must survive a power cycle, the FINGERPRINT, is packed into `from`;
+        `event` carries the repeat tag. `to` is the bit count, which is
+        redundant with the fingerprint's prefix but keeps the printed line
+        readable without parsing.
 
         The server also dedupes on (kind, from, to, event, boundary) within
         2s: for IR that means a held button's identical repeat frames collapse
         to about one mark per 2s, while the press itself always lands because
-        its `event` differs from its repeats' (" repeat"). The clip recorder
-        keeps every frame; the session archive records that the button was
-        down, not the 9 Hz carrier.
+        its `event` differs from its repeats' ("repeat" vs None). The clip
+        recorder keeps every frame; the session archive records that the
+        button was down, not the ~30 Hz re-send.
         """
         self._send({
             "t": round(t, 3), "kind": "ir",
-            "from": ev.get("address_hex", "0x%02X" % ev.get("address", 0)),
-            "to": "0x%02X" % ev.get("command", 0),
-            "event": ev.get("hex", "?") + (" repeat" if ev.get("repeat") else ""),
+            "from": ev.get("fp", "?"),
+            "to": "%db" % ev.get("bits", 0),
+            "event": "repeat" if ev.get("repeat") else None,
             "boundary": None,
             # ring-only detail (stripped from the persisted log)
-            "address": ev.get("address"), "command": ev.get("command"),
-            "scancode": ev.get("scancode"), "repeat": ev.get("repeat"),
-            "ir_ts": ev.get("ts"),
+            "repeat": ev.get("repeat"), "ir_ts": ev.get("ts"),
         })

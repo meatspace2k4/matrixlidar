@@ -1,200 +1,193 @@
-"""IR receiver: the kernel decodes, this records what it decoded.
+"""IR receiver: fingerprint the raw pulse train, decode nothing.
 
-Same part and the same path as the ir ipad bridge on aircheck-pi: a TSOP38238
-on a GPIO pin, the `gpio-ir` device-tree overlay, and rc-core doing the NEC
-decode in kernel space. Nothing here touches a GPIO or times a pulse. The
-kernel hands over a finished scancode on an input device and this module does
-three things with it: find that device, split the scancode into the NEC
-address and command, and hold the events until a recorder drains them.
+The bathroom remote is a toilet remote. It shares the NEC family's bit
+TIMING (~560us pulses, ~560us/~1690us spaces) but not the NEC frame: wrong
+bit count, no address/inverse-address structure, so the kernel's protocol
+decoders (built for TV remotes) validate every burst, fail, and emit
+nothing. Scancodes do not exist for this remote and never will.
 
-  from bathroom import ir
-  rx = ir.Receiver()
-  rx.start()                 # False if there is no receiver; see rx.source
-  ...
-  for ev in rx.drain(t0):    # [{t, ts, address, command, scancode, repeat}]
+So this module does not ask the kernel to understand the signal. It reads
+the raw demodulated stream from /dev/lirc0 (LIRC_MODE2: one u32 per pulse,
+space, or timeout) and reduces each frame to a FINGERPRINT:
 
-WHY THE ADDRESS IS THE POINT
+  - a frame is the pulse/space run between quiet gaps (>= FRAME_GAP_US or
+    the receiver's own timeout marker)
+  - within a frame, only the SPACES carry information in this timing
+    family (pulses are all ~560us); each space quantizes to a bit,
+    short=0 long=1
+  - the fingerprint is the bit count plus the bits packed big-endian into
+    hex: "84:0d0a0300c380440107..."
 
-A NEC frame is an address and a command. The address says which device the
-remote is talking to and is stable across every button on that remote; the
-command says which button. A log of commands alone cannot tell two remotes
-apart, which is the question a bathroom recording is going to be asked.
+Same button -> same fingerprint, different button -> different fingerprint,
+which is everything recording and replay need. What the bits MEAN is the
+remote's business.
 
-FINDING THE DEVICE IS NOT "event0"
+No root anywhere: /dev/lirc0 is group video and the daemon user is in it.
+No ir-keytable, no protocol enabling, no keymaps. The gpio-ir overlay in
+config.txt is the only system dependency.
 
-The bridge hardcodes IR_DEVICE=/dev/input/event0 and gets away with it. Here
-that would read an HDMI connector: bath-pi enumerates four input devices
-before any IR exists (vc4-hdmi-0, its ALSA jack, vc4-hdmi-1, its jack), and
-two of them sit under /sys/class/rc as CEC receivers, so even "it is an rc
-device" is not enough of a test. The discriminator is the protocol list:
-a CEC endpoint offers [cec] and an IR receiver offers nec / rc-5 / and
-friends. See `find_device`.
+  python3 -m bathroom.ir      # print fingerprints live, to check wiring
 
-NOTHING HERE IS REQUIRED
-
-Every entry point fails soft and says why in `source`. A recording made from
-a machine with no receiver wired to it -- a laptop, or a Pi whose overlay is
-not loaded -- gets an empty IR log and a stated reason, never a crash and
-never a fabricated event.
+Every entry point fails soft and says why in `source`: a machine with no
+receiver records lidar exactly as before, and the clip states the reason
+instead of carrying an empty lie.
 """
 import os
-import re
 import struct
 import threading
 import time
 
 from collections import deque
 
-# struct input_event: struct timeval (two longs), __u16 type, __u16 code,
-# __s32 value. Same unpack the bridge uses, on the same 64-bit ARM kernel.
-EVENT_FORMAT = "llHHi"
-EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+# LIRC_MODE2 stream: u32 little-endian, top byte the kind, low 24 bits usec.
+MODE2_SPACE = 0x00
+MODE2_PULSE = 0x01
+MODE2_FREQ = 0x02
+MODE2_TIMEOUT = 0x03
 
-EV_MSC = 0x04
-MSC_SCAN = 0x04
+FRAME_GAP_US = 10000   # a space this long ends a frame. Frames within a held
+                       # press arrive ~20-45ms apart; intra-frame spaces top
+                       # out ~1.7ms. An order of magnitude sits between.
+BIT_SPLIT_US = 1100    # short/long space boundary: the observed clusters are
+                       # ~560us and ~1690us, this is the midpoint gap.
+MIN_FRAME_BITS = 8     # anything shorter is a glitch, not a button
 
-# A held NEC button repeats about every 110ms. Anything closer than this to
-# the previous frame of the SAME scancode is the remote still being held, not
-# a second press. Recorded either way (see the module docstring: the log is
-# what arrived), but flagged, because "12 presses" and "one long press" are
-# very different readings of the same twelve lines.
+# A held button re-sends its frame every few tens of ms. Same fingerprint
+# within this window is the button still down, not a second press. Logged
+# either way, flagged, because "12 presses" and "one long press" are very
+# different readings of the same twelve lines.
 REPEAT_WINDOW_S = 0.25
 
-QUEUE_MAX = 4096    # a drained queue never approaches this; the cap exists so
-                    # an undrained receiver leaks nothing worse than 4096 dicts
+QUEUE_MAX = 4096       # an undrained receiver leaks nothing worse than this
 
-INPUT_DEVICES = "/proc/bus/input/devices"
 RC_CLASS = "/sys/class/rc"
 
-_SYSFS_RC = re.compile(r"/rc/(rc\d+)")
-_EVENT_HANDLER = re.compile(r"\b(event\d+)\b")
+
+def fingerprint(spaces):
+    """bits:hex fingerprint from a frame's intra-frame space durations."""
+    bits = ["1" if us > BIT_SPLIT_US else "0" for us in spaces]
+    n = len(bits)
+    if n < MIN_FRAME_BITS:
+        return None
+    val = int("".join(bits), 2)
+    return "%d:%0*x" % (n, (n + 3) // 4, val)
 
 
-def split_scancode(scancode):
-    """(address, command) from an rc-core NEC scancode.
+class FrameAssembler:
+    """Feed it mode2 words; it yields one fingerprint per completed frame.
 
-    rc-core packs every NEC width the same way: the command is the low byte
-    and everything above it is the address. 0x7902 is address 0x79 command
-    0x02 (8-bit NEC); extended NEC just makes the address 16 bits wide and
-    NEC32 24, and the split does not move. Yamaha's remote in the bridge's
-    map reads 0x79/0x7A, which is that same low-byte rule.
+    Pure and incremental: a frame split across two os.read() chunks is the
+    normal case, not an edge case, so state lives here rather than in the
+    read loop.
     """
-    return scancode >> 8, scancode & 0xFF
+
+    __slots__ = ("_spaces", "_saw_pulse", "_tail")
+
+    def __init__(self):
+        self._spaces = []
+        self._saw_pulse = False
+        self._tail = b""    # partial trailing word from the previous feed
+
+    def feed(self, data):
+        """Consume raw bytes (any split), return fingerprints completed."""
+        out = []
+        data = self._tail + data
+        cut = len(data) & ~3
+        data, self._tail = data[:cut], data[cut:]
+        for (word,) in struct.iter_unpack("<I", data):
+            kind, usec = word >> 24, word & 0xFFFFFF
+            if kind == MODE2_PULSE:
+                self._saw_pulse = True
+            elif kind == MODE2_SPACE and self._saw_pulse:
+                if usec >= FRAME_GAP_US:
+                    self._flush(out)
+                else:
+                    self._spaces.append(usec)
+            elif kind == MODE2_TIMEOUT:
+                self._flush(out)
+            # frequency reports and leading idle spaces carry nothing
+        return out
+
+    def _flush(self, out):
+        if self._spaces:
+            fp = fingerprint(self._spaces)
+            if fp is not None:
+                out.append(fp)
+        self._spaces = []
+        self._saw_pulse = False
 
 
-def _blocks(text):
-    """/proc/bus/input/devices split into per-device blocks of {letter: [lines]}."""
-    out = []
-    cur = {}
-    for line in text.splitlines():
-        if not line.strip():
-            if cur:
-                out.append(cur)
-            cur = {}
-            continue
-        if len(line) > 2 and line[1] == ":":
-            cur.setdefault(line[0], []).append(line[3:].strip())
-    if cur:
-        out.append(cur)
-    return out
+def find_device(rc_root=RC_CLASS):
+    """(lirc_path, info) for the raw IR receiver, or (None, info) with why.
 
-
-def rc_protocols(rc_name, root=RC_CLASS):
-    """The protocol list of /sys/class/rc/<rc_name>, e.g. ['nec'] or ['cec'].
-
-    The enabled ones are bracketed in that file ("rc-5 [nec] sony"); the
-    brackets are stripped here and the enabled set is reported separately by
-    `enabled_protocols`.
+    Walks /sys/class/rc rather than trusting a device number: HDMI CEC
+    endpoints are rc devices too. The receiver is the rc device that offers
+    more than bare cec and exposes a lircN node.
     """
+    info = {"searched": rc_root}
     try:
-        with open(os.path.join(root, rc_name, "protocols")) as f:
-            raw = f.read().split()
-    except OSError:
-        return []
-    return [p.strip("[]") for p in raw]
-
-
-def enabled_protocols(rc_name, root=RC_CLASS):
-    """Just the bracketed (enabled) protocols. Empty means the kernel will
-    hand over nothing: the receiver is there and no decoder is running on it,
-    which is what `ir-keytable -p nec` turns on."""
-    try:
-        with open(os.path.join(root, rc_name, "protocols")) as f:
-            raw = f.read().split()
-    except OSError:
-        return []
-    return [p[1:-1] for p in raw if p.startswith("[") and p.endswith("]")]
-
-
-def find_device(devices_path=INPUT_DEVICES, rc_root=RC_CLASS):
-    """(event_path, info) for the IR receiver, or (None, info) with a reason.
-
-    Walks the input device table rather than trusting an event number: the
-    numbering depends on what else the kernel enumerated first, and on this
-    Pi that is four HDMI devices. A candidate must be an rc-core device whose
-    protocol list is something other than bare CEC.
-    """
-    info = {"searched": devices_path}
-    try:
-        with open(devices_path) as f:
-            text = f.read()
+        names = sorted(os.listdir(rc_root))
     except OSError as e:
-        info["reason"] = "cannot read %s: %s" % (devices_path, e)
+        info["reason"] = "cannot read %s: %s" % (rc_root, e)
         return None, info
 
     rejected = []
-    for b in _blocks(text):
-        name = (b.get("N") or [""])[0]
-        name = name[6:-1] if name.startswith('Name="') and name.endswith('"') else name
-        handlers = " ".join(b.get("H") or [])
-        sysfs = (b.get("S") or [""])[0]
-        sysfs = sysfs[6:] if sysfs.startswith("Sysfs=") else sysfs
-        m_ev = _EVENT_HANDLER.search(handlers)
-        m_rc = _SYSFS_RC.search(sysfs)
-        if not m_ev or not m_rc:
+    for rc in names:
+        try:
+            with open(os.path.join(rc_root, rc, "protocols")) as f:
+                protos = [p.strip("[]") for p in f.read().split()]
+        except OSError:
             continue
-        rc_name = m_rc.group(1)
-        protos = rc_protocols(rc_name, rc_root)
         if protos and set(protos) <= {"cec"}:
-            rejected.append("%s (%s: cec)" % (name, rc_name))
+            rejected.append("%s (cec)" % rc)
             continue
-        return "/dev/input/" + m_ev.group(1), {
-            "searched": devices_path, "name": name, "rc": rc_name,
-            "protocols": protos, "enabled": enabled_protocols(rc_name, rc_root),
-        }
+        lirc = [d for d in sorted(os.listdir(os.path.join(rc_root, rc)))
+                if d.startswith("lirc")]
+        if not lirc:
+            rejected.append("%s (no lirc node)" % rc)
+            continue
+        dev = "/dev/" + lirc[0]
+        name = "?"
+        try:
+            with open(os.path.join(rc_root, rc, "device_name")) as f:
+                name = f.read().strip()
+        except OSError:
+            pass
+        return dev, {"searched": rc_root, "rc": rc, "name": name,
+                     "protocols": protos}
 
-    info["reason"] = ("no IR receiver among the input devices"
+    info["reason"] = ("no IR receiver among the rc devices"
                       + (" (rejected: %s)" % ", ".join(rejected) if rejected
                          else ""))
     return None, info
 
 
 class Receiver:
-    """Reads decoded IR scancodes off the kernel in a background thread.
+    """Fingerprints raw IR frames off /dev/lirc0 in a background thread.
 
-    The read is blocking, so it lives on its own thread and the events land in
-    a queue the recorder drains once per frame. The frame loop must never wait
-    on a remote nobody pressed.
+    The read blocks, so it lives on its own thread and events land in a
+    queue the recorder drains once per lidar frame. The frame loop must
+    never wait on a remote nobody pressed.
     """
 
     __slots__ = ("device", "source", "_fd", "_thread", "_q", "_stop",
-                 "_last_code", "_last_ts")
+                 "_asm", "_last_fp", "_last_ts")
 
     def __init__(self, device=None):
-        # An explicit device beats discovery, and IR_DEVICE beats both -- the
-        # bridge sets exactly that variable in its unit file.
+        # An explicit device beats discovery, and IR_DEVICE beats both.
         self.device = device or os.environ.get("IR_DEVICE") or None
         self.source = {"device": self.device, "state": "unstarted"}
         self._fd = None
         self._thread = None
         self._q = deque(maxlen=QUEUE_MAX)
         self._stop = threading.Event()
-        self._last_code = None
+        self._asm = FrameAssembler()
+        self._last_fp = None
         self._last_ts = 0.0
 
     def start(self):
-        """Open the receiver and start reading. False (never an exception) if
-        there is nothing to open; `source` then carries the reason."""
+        """Open the receiver and start reading. False (never an exception)
+        if there is nothing to open; `source` then carries the reason."""
         if self.device is None:
             dev, info = find_device()
             self.source.update(info)
@@ -219,45 +212,29 @@ class Receiver:
         fd = self._fd
         while not self._stop.is_set():
             try:
-                data = os.read(fd, EVENT_SIZE)
+                data = os.read(fd, 4096)
             except OSError:
                 break              # closed under us by close(), or unplugged
             if not data:
-                break              # EOF: the device went away (and a plain
-                                   # file, which is how the tests feed this,
-                                   # ends rather than blocking). Returning to
-                                   # the read would spin on nothing.
-            if len(data) < EVENT_SIZE:
-                continue
-            sec, usec, ev_type, ev_code, ev_value = struct.unpack(
-                EVENT_FORMAT, data)
-            if ev_type != EV_MSC or ev_code != MSC_SCAN:
-                continue           # EV_KEY/EV_SYN of the same press, or noise
-            # The timeval is the kernel's own CLOCK_REALTIME stamp for the
-            # frame. Use it rather than "when this thread woke up": the wake
-            # can be late and the recording is meant to say when the signal
-            # arrived, not when Python noticed.
-            ts = sec + usec / 1e6
-            scancode = ev_value & 0xFFFFFFFF
-            address, command = split_scancode(scancode)
-            repeat = (scancode == self._last_code
-                      and ts - self._last_ts <= REPEAT_WINDOW_S)
-            self._last_code, self._last_ts = scancode, ts
-            self._q.append({
-                "ts": round(ts, 6),
-                "scancode": scancode,
-                "hex": "0x%04X" % scancode,
-                "address": address,
-                "address_hex": "0x%02X" % address,
-                "command": command,
-                "repeat": repeat,
-            })
+                break              # EOF: device gone (or a plain file in the
+                                   # tests, which ends instead of blocking)
+            # The lirc chardev carries durations, not wall times; the frame
+            # is stamped when its terminating gap is read, which is within
+            # one gap (~tens of ms) of the truth.
+            ts = time.time()
+            for fp in self._asm.feed(data):
+                repeat = (fp == self._last_fp
+                          and ts - self._last_ts <= REPEAT_WINDOW_S)
+                self._last_fp, self._last_ts = fp, ts
+                self._q.append({"ts": round(ts, 6), "fp": fp,
+                                "bits": int(fp.split(":", 1)[0]),
+                                "repeat": repeat})
 
     def drain(self, t0=None):
-        """Every event since the last drain, oldest first.
+        """Every fingerprint since the last drain, oldest first.
 
-        With `t0` (the recording's wall-clock start) each event also gets `t`,
-        seconds into the recording, on the same axis as the frames.
+        With `t0` (the recording's wall-clock start) each event also gets
+        `t`, seconds into the recording, on the frames' axis.
         """
         out = []
         while True:
@@ -285,24 +262,19 @@ def describe(source):
     """One line for a human: what the IR side of a recording actually was."""
     state = source.get("state")
     if state == "open":
-        enabled = source.get("enabled")
-        return "IR %s (%s%s)" % (
-            source.get("device"), source.get("name", "?"),
-            ", decoding %s" % "/".join(enabled) if enabled
-            else ", NO decoder enabled: run ir-keytable -p nec")
+        return "IR %s (%s, raw fingerprinting)" % (
+            source.get("device"), source.get("name", "?"))
     return "IR unavailable (%s): %s" % (state, source.get("reason", "-"))
 
 
 def format_event(ev):
     """One line for a human, for the replay printer and the recorder alike."""
-    return "addr=%s cmd=0x%02X scancode=%s%s" % (
-        ev.get("address_hex", "0x%02X" % ev.get("address", 0)),
-        ev.get("command", 0), ev.get("hex", "?"),
-        " (repeat)" if ev.get("repeat") else "")
+    return "fp=%s%s" % (ev.get("fp", "?"),
+                        " (repeat)" if ev.get("repeat") else "")
 
 
 def _main():
-    """python3 -m bathroom.ir -- print what the receiver sees, to check wiring."""
+    """python3 -m bathroom.ir -- print what the receiver sees, live."""
     rx = Receiver()
     ok = rx.start()
     print(describe(rx.source), flush=True)
@@ -313,7 +285,8 @@ def _main():
     try:
         while True:
             for ev in rx.drain(t0):
-                print("  t=%7.2fs  %s" % (ev["t"], format_event(ev)), flush=True)
+                print("  t=%7.2fs  %s" % (ev["t"], format_event(ev)),
+                      flush=True)
             time.sleep(0.05)
     except KeyboardInterrupt:
         return 0

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""IR capture regression: scancode -> address, device discovery, and the
-round trip from a clip's recorded log to the line the washlet daemon prints.
+"""IR fingerprint regression: raw mode2 words -> stable per-button IDs, and
+the round trip from a clip's recorded log to the line the daemon prints.
 
-No IR hardware is involved. The kernel interface is a file of struct
-input_event and a text table under /proc, so both are built here as real
-files and read through the real code path.
+No IR hardware is involved. The kernel interface is a stream of u32 words
+and a directory tree under /sys/class/rc, so both are built here as real
+bytes and real directories and read through the real code path. The pulse
+timings are the bathroom remote's own, measured off /dev/lirc0 on bath-pi:
+~560us pulses, ~560/~1690us spaces, >=20ms quiet between frames.
 
   python3 tests/test_ir.py
 """
@@ -28,127 +30,123 @@ def check(cond, msg):
         FAILS.append(msg)
 
 
-def event_bytes(sec, usec, ev_type, code, value):
-    return struct.pack(ir.EVENT_FORMAT, sec, usec, ev_type, code, value)
+def w(kind, usec):
+    return struct.pack("<I", (kind << 24) | usec)
 
 
-# The four HDMI input devices bath-pi enumerates before any IR exists, plus a
-# gpio-ir receiver. Verbatim shape of /proc/bus/input/devices.
-DEVICES = """\
-I: Bus=0019 Vendor=0000 Product=0000 Version=0000
-N: Name="vc4-hdmi-0"
-P: Phys=vc4-hdmi-0/input0
-S: Sysfs=/devices/platform/soc/fef00700.hdmi/rc/rc0/input0
-U: Uniq=
-H: Handlers=kbd event0
-B: PROP=0
-
-I: Bus=0000 Vendor=0000 Product=0000 Version=0000
-N: Name="vc4-hdmi-0 HDMI Jack"
-P: Phys=ALSA
-S: Sysfs=/devices/platform/soc/fef00700.hdmi/sound/card0/input1
-U: Uniq=
-H: Handlers=event1
-B: PROP=0
-
-I: Bus=0019 Vendor=0001 Product=0001 Version=0100
-N: Name="gpio_ir_recv"
-P: Phys=gpio_ir_recv/input0
-S: Sysfs=/devices/platform/ir-receiver@19/rc/rc2/input5
-U: Uniq=
-H: Handlers=kbd event5
-B: PROP=0
-"""
+def frame(bits, jitter=0):
+    """Raw mode2 bytes for one frame carrying `bits` (a '01' string), using
+    the measured timings. `jitter` shifts every duration, because the real
+    receiver wobbles +-40us and the fingerprint must not."""
+    out = b""
+    for b in bits:
+        out += w(ir.MODE2_PULSE, 560 + jitter)
+        out += w(ir.MODE2_SPACE, (1690 if b == "1" else 560) + jitter)
+    out += w(ir.MODE2_PULSE, 560 + jitter)      # closing mark
+    out += w(ir.MODE2_TIMEOUT, 22000)
+    return out
 
 
-def fake_rc(root):
-    """/sys/class/rc laid out the way bath-pi and aircheck-pi have it: two
-    CEC endpoints from the HDMI blocks, one real receiver with nec enabled."""
-    for name, protocols in (("rc0", "[cec]"), ("rc1", "[cec]"),
-                            ("rc2", "rc-5 [nec] sony sharp")):
-        os.makedirs(os.path.join(root, name))
-        with open(os.path.join(root, name, "protocols"), "w") as f:
-            f.write(protocols + "\n")
-    return root
+BUTTON_A = "0110100101101001010110010110100101011010"  # 40 bits
+BUTTON_B = "0110100101101001010110010110100101011001"  # differs in last bit
 
 
 def main():
     n = 0
 
-    # --- the address is the low-byte split ----------------------------------
-    # Yamaha codes from the bridge's own SCANCODE_MAP: address 0x79 for the CD
-    # transport, 0x7A for main volume, and one 0x7E.
-    for scancode, addr, cmd in ((0x7902, 0x79, 0x02), (0x7955, 0x79, 0x55),
-                                (0x7A1A, 0x7A, 0x1A), (0x7E2A, 0x7E, 0x2A)):
-        a, c = ir.split_scancode(scancode)
-        check((a, c) == (addr, cmd),
-              "0x%04X -> address 0x%02X command 0x%02X" % (scancode, addr, cmd))
-        n += 1
-    # extended NEC: a 16-bit address keeps the same split
-    check(ir.split_scancode(0x1234AB) == (0x1234, 0xAB),
-          "extended NEC keeps the command in the low byte")
+    # --- the fingerprint itself ---------------------------------------------
+    asm = ir.FrameAssembler()
+    fps = asm.feed(frame(BUTTON_A))
+    check(len(fps) == 1, "one frame -> one fingerprint")
+    fp_a = fps[0]
+    check(fp_a.startswith("40:"), "the fingerprint states its bit count")
+    n += 2
+
+    check(ir.FrameAssembler().feed(frame(BUTTON_A, jitter=40)) == [fp_a],
+          "+-40us receiver wobble does not move the fingerprint")
+    fp_b = ir.FrameAssembler().feed(frame(BUTTON_B))[0]
+    check(fp_b != fp_a, "one flipped bit is a different fingerprint")
+    n += 2
+
+    # --- segmentation -------------------------------------------------------
+    # two frames separated by a long SPACE (no timeout word): still two
+    asm = ir.FrameAssembler()
+    blob = frame(BUTTON_A)[:-4] + w(ir.MODE2_SPACE, 28000) + frame(BUTTON_B)
+    fps = asm.feed(blob)
+    check(fps == [fp_a, fp_b], "a >=10ms space splits frames like a timeout")
     n += 1
 
-    # --- discovery rejects HDMI/CEC and finds the receiver ------------------
+    # a frame split across arbitrary read() boundaries reassembles
+    blob = frame(BUTTON_A)
+    for cut in (4, 30, len(blob) - 8):
+        asm = ir.FrameAssembler()
+        fps = asm.feed(blob[:cut]) + asm.feed(blob[cut:])
+        check(fps == [fp_a], "chunk split at byte %d reassembles" % cut)
+        n += 1
+
+    # leading idle space (the 16.7s max-usec word lirc emits first) is noise
+    asm = ir.FrameAssembler()
+    fps = asm.feed(w(ir.MODE2_SPACE, 0xFFFFFF) + frame(BUTTON_A))
+    check(fps == [fp_a], "leading idle space is not a frame")
+    check(ir.FrameAssembler().feed(
+        w(ir.MODE2_PULSE, 560) + w(ir.MODE2_SPACE, 560)
+        + w(ir.MODE2_PULSE, 560) + w(ir.MODE2_TIMEOUT, 22000)) == [],
+        "a sub-8-bit glitch fingerprints as nothing")
+    n += 2
+
+    # --- discovery walks /sys/class/rc and rejects CEC ----------------------
     with tempfile.TemporaryDirectory() as d:
-        devices = os.path.join(d, "devices")
-        with open(devices, "w") as f:
-            f.write(DEVICES)
-        rc_root = fake_rc(os.path.join(d, "rc"))
-
-        dev, info = ir.find_device(devices, rc_root)
-        check(dev == "/dev/input/event5",
-              "discovery finds the gpio-ir receiver, not HDMI event0")
-        check(info.get("name") == "gpio_ir_recv", "it names what it found")
-        check(info.get("enabled") == ["nec"], "and reports the enabled decoder")
-        n += 3
-
-        # the same table with the receiver removed: no guess, a stated reason
-        with open(devices, "w") as f:
-            f.write(DEVICES.split('I: Bus=0019 Vendor=0001')[0])
-        dev, info = ir.find_device(devices, rc_root)
-        check(dev is None, "no receiver -> no device")
-        check("cec" in info.get("reason", ""),
-              "and the reason names the CEC endpoints it rejected")
+        for rc, protos, lirc in (("rc0", "rc-5 [nec] sony [lirc]", "lirc0"),
+                                 ("rc1", "[cec]", None),
+                                 ("rc2", "[cec]", None)):
+            os.makedirs(os.path.join(d, rc))
+            with open(os.path.join(d, rc, "protocols"), "w") as f:
+                f.write(protos + "\n")
+            if lirc:
+                os.makedirs(os.path.join(d, rc, lirc))
+                with open(os.path.join(d, rc, "device_name"), "w") as f:
+                    f.write("gpio_ir_recv\n")
+        dev, info = ir.find_device(d)
+        check(dev == "/dev/lirc0", "discovery finds the receiver's lirc node")
+        check(info.get("name") == "gpio_ir_recv", "and names what it found")
         n += 2
 
-    # --- reading the device -------------------------------------------------
-    with tempfile.TemporaryDirectory() as d:
-        path = os.path.join(d, "event")
-        t0 = time.time()
-        with open(path, "wb") as f:
-            # a press, its EV_KEY/EV_SYN company (ignored), then a repeat
-            # frame 0.11s later (a held button), then a genuine second press
-            f.write(event_bytes(int(t0), 250000, ir.EV_MSC, ir.MSC_SCAN, 0x7902))
-            f.write(event_bytes(int(t0), 250000, 0x01, 0x0207, 1))
-            f.write(event_bytes(int(t0), 250000, 0x00, 0x00, 0))
-            f.write(event_bytes(int(t0), 360000, ir.EV_MSC, ir.MSC_SCAN, 0x7902))
-            f.write(event_bytes(int(t0) + 3, 250000, ir.EV_MSC, ir.MSC_SCAN, 0x7A1A))
+        for rc in ("rc0",):
+            os.rename(os.path.join(d, rc), os.path.join(d, "gone"))
+        import shutil
+        shutil.rmtree(os.path.join(d, "gone"))
+        dev, info = ir.find_device(d)
+        check(dev is None and "cec" in info.get("reason", ""),
+              "no receiver -> no device, and the reason names the CEC rejects")
+        n += 1
 
+    # --- reading a device ---------------------------------------------------
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "lirc")
+        with open(path, "wb") as f:
+            f.write(frame(BUTTON_A))            # press
+            f.write(frame(BUTTON_A))            # held: same fp, right away
+            f.write(frame(BUTTON_B))            # a different button
         rx = ir.Receiver(device=path)
         check(rx.start(), "an explicit device opens without discovery")
-        for _ in range(50):                    # let the reader thread drain it
+        for _ in range(100):
             time.sleep(0.01)
             if len(rx._q) >= 3:
                 break
-        evs = rx.drain(t0=int(t0))
+        t0 = time.time() - 1.0
+        evs = rx.drain(t0)
         rx.close()
-        n += 1
-
-        check(len(evs) == 3, "only EV_MSC/MSC_SCAN becomes an event (3 of 5)")
-        check([e["address_hex"] for e in evs] == ["0x79", "0x79", "0x7A"],
-              "each event carries the address it was addressed to")
+        check([e["fp"] for e in evs] == [fp_a, fp_a, fp_b],
+              "the stream fingerprints in order")
         check([e["repeat"] for e in evs] == [False, True, False],
-              "a frame 0.11s after the same code is a held button, not a press")
-        check(evs[0]["command"] == 0x02 and evs[2]["command"] == 0x1A,
-              "the command rides along with the address")
-        check(abs(evs[0]["t"] - 0.25) < 0.001 and abs(evs[2]["t"] - 3.25) < 0.001,
-              "t comes from the kernel timestamp, not from when we woke up")
+              "an identical frame within 250ms is a held button")
+        check(all(e["bits"] == 40 for e in evs), "bit count rides along")
+        check(all(e["t"] >= 0.9 for e in evs), "t is anchored on the drain origin")
         check(rx.drain() == [], "a second drain is empty: events are consumed")
         n += 6
 
     # --- absent hardware is a fact, not a crash -----------------------------
-    rx = ir.Receiver(device="/nonexistent/event99")
+    rx = ir.Receiver(device="/nonexistent/lirc99")
     check(rx.start() is False, "a missing device fails soft")
     check(rx.source["state"] == "unreadable" and "reason" in rx.source,
           "and says why, for the clip to record")
@@ -156,9 +154,6 @@ def main():
     n += 3
 
     # --- the replay round trip ----------------------------------------------
-    # A clip's ir log -> stub_pi's wire lines -> stream's parser -> the line
-    # the washlet daemon prints. This is the whole feature, end to end, with
-    # the socket left out.
     sys.path.insert(0, os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "evals"))
     import stub_pi                                               # noqa: E402
@@ -172,12 +167,10 @@ def main():
                 "frames": [{"t": 0.0, "mm": [100] * 64},
                            {"t": 0.1, "mm": [100] * 64},
                            {"t": 0.2, "mm": [100] * 64}],
-                "ir": [{"t": -0.02, "ts": 1.0, "scancode": 0x7902,
-                        "hex": "0x7902", "address": 0x79, "address_hex": "0x79",
-                        "command": 0x02, "repeat": False},
-                       {"t": 0.15, "ts": 1.17, "scancode": 0x7A1A,
-                        "hex": "0x7A1A", "address": 0x7A, "address_hex": "0x7A",
-                        "command": 0x1A, "repeat": True}],
+                "ir": [{"t": -0.02, "ts": 1.0, "fp": fp_a, "bits": 40,
+                        "repeat": False},
+                       {"t": 0.15, "ts": 1.17, "fp": fp_a, "bits": 40,
+                        "repeat": True}],
             }, f)
         frames, irlog = stub_pi.load_frames([clip, clip])
         check(len(frames) == 6 and len(irlog) == 4,
@@ -186,15 +179,13 @@ def main():
               "the second clip's presses land during the second clip's frames")
         n += 2
 
-        # what the stub would write, fed to the parser the daemon reads with
         for ev in irlog:
             stream._ir.append(json.loads(json.dumps(ev)))
         got = stream.drain_ir()
         check(len(got) == 4 and stream.drain_ir() == [],
               "the daemon drains each signal exactly once")
-        check(ir.format_event(got[0]) ==
-              "addr=0x79 cmd=0x02 scancode=0x7902",
-              "the printed line leads with the address")
+        check(ir.format_event(got[0]) == "fp=" + fp_a,
+              "the printed line is the fingerprint")
         check(ir.format_event(got[1]).endswith("(repeat)"),
               "a held button is marked in the printed line")
         n += 3
