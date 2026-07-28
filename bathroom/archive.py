@@ -54,3 +54,32 @@ class Marker:
             self._send({"t": round(t, 3), "kind": "posture",
                         "from": u.event.state.name, "to": u.committed.name,
                         "event": None, "boundary": None})
+
+    def ir(self, ev, t):
+        """Mark one decoded IR signal into the session archive.
+
+        The server's persisted log keeps only {ts,t,kind,from,to,event,
+        boundary} per mark (lidar_server._event_only), so the fields that must
+        survive a power cycle are packed into that shape: the ADDRESS in
+        `from`, the command in `to`, the scancode (with a repeat tag) in
+        `event`. The full decode rides alongside for the RAM ring, which
+        stores the mark verbatim.
+
+        The server also dedupes on (kind, from, to, event, boundary) within
+        2s: for IR that means a held button's identical repeat frames collapse
+        to about one mark per 2s, while the press itself always lands because
+        its `event` differs from its repeats' (" repeat"). The clip recorder
+        keeps every frame; the session archive records that the button was
+        down, not the 9 Hz carrier.
+        """
+        self._send({
+            "t": round(t, 3), "kind": "ir",
+            "from": ev.get("address_hex", "0x%02X" % ev.get("address", 0)),
+            "to": "0x%02X" % ev.get("command", 0),
+            "event": ev.get("hex", "?") + (" repeat" if ev.get("repeat") else ""),
+            "boundary": None,
+            # ring-only detail (stripped from the persisted log)
+            "address": ev.get("address"), "command": ev.get("command"),
+            "scancode": ev.get("scancode"), "repeat": ev.get("repeat"),
+            "ir_ts": ev.get("ts"),
+        })

@@ -78,6 +78,11 @@ def _label(tr):
     when = time.strftime("%H:%M:%S", time.localtime(tr["ts"]))
     ev = " [%s]" % tr["event"] if tr.get("event") else ""
     t = "t=%7.2fs  " % tr["t"] if tr.get("t") is not None else ""
+    if tr["kind"] == "ir":
+        # an ir mark packs address/command/scancode into from/to/event so
+        # they survive the server's persisted-log field whitelist
+        return "%s  %sir      addr=%s cmd=%s%s" % (when, t, tr["from"],
+                                                   tr["to"], ev)
     return "%s  %s%-7s %s -> %s%s" % (when, t, tr["kind"], tr["from"], tr["to"], ev)
 
 
