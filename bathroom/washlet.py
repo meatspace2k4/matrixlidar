@@ -1,10 +1,10 @@
-"""Washlet jukebox daemon: entry sound on walk-in, the track on sit.
+"""Washlet jukebox daemon: entry sound on walk-in, the track on the day's first sit.
 
   python3 -m bathroom.washlet             # live
   python3 -m bathroom.washlet --dry-run   # log decisions, no audio
 
 Consumes the same stream -> StateEngine -> OccupancyEngine stack as
-bathroom.live. The main track (--media) plays on sit, once per session.
+bathroom.live. The main track (--media) plays on sit, once per DAY.
 An OPTIONAL entry sound (--queue-media) can play on walk-in; it is
 DISABLED by default (empty), and with it disabled nothing plays on entry.
 Decisions:
@@ -14,21 +14,29 @@ Decisions:
   if one is configured, otherwise no audio (the machinery still runs).
 - PLAY: committed SITTING_AT_TOILET holds --hold seconds -> kill whatever
   is streaming and start the MAIN track from the top at --volume. Happens
-  once per session: the latch blocks replays on continued sitting,
-  stand-up/sit-down cycles, and the track ending.
+  once per day: the latch blocks replays on continued sitting,
+  stand-up/sit-down cycles, the track ending, and every later visit.
 - UNQUEUE: occupancy ends with no sit (entry aborted, stream gap, or exit)
   -> stop the entry sound.
-- REARM (exit condition): room EMPTY while posture also reads EMPTY -> stop
-  playback, clear the latch. The posture guard means a room misread under a
-  seated body can never rearm-and-replay; a gap (UNKNOWN) holds the latch,
-  and a latched (audible) stream is never stopped by a mere gap.
+- STOP (exit condition): the visit that played ends -- room EMPTY while
+  posture also reads EMPTY -> stop playback. The latch is NOT touched. The
+  posture guard means a room misread under a seated body can never cut the
+  track, and a gap (UNKNOWN) is not an exit.
+- REARM: --day-start (05:00) passes -> clear the latch. This is the ONLY
+  clock-driven decision, and the only thing that rearms a running daemon.
 
 Every stream start gets the volume poke (a second atvremote, retried
 across the startup window because a set accepted mid-handshake can be
 overridden when audio starts); the session's own starting volume is
 receiver state we do not trust. Both media files must exist at startup
-(fail loud, no fallbacks). State is in-memory only; a daemon restart
-forgets the latch (worst case: one extra play into an occupied session).
+(fail loud, no fallbacks).
+
+THE LATCH IS IN MEMORY ONLY, DELIBERATELY. Nothing is written to disk and
+nothing is read at startup, so a restart -- a crash, a redeploy, a power
+cut -- comes up rearmed and the next sit plays. That is the stateless
+trade taken on purpose: the failure mode is one extra play after a reboot,
+against a state file that can outlive its meaning (a stale latch after an
+outage silently costs the whole day's play, with nothing to show for it).
 """
 import argparse
 import json
@@ -61,6 +69,10 @@ SIT_HOLD_S = 2.0    # SITTING must be OBSERVED for this long before the track
                     # was 0.0: fire the moment the posture commits to
                     # SITTING. The engine's commit_after already requires
                     # several consecutive frames, so this is not one noisy frame.
+DAY_START_H = 5     # local hour the latch clears. The day boundary sits in the
+                    # dead middle of the night on purpose: a 00:00 rollover
+                    # would rearm on top of someone who is still up, and hand
+                    # the same person the track twice in one waking day.
 VOLUME = 20         # HomePod volume % applied as soon as the session accepts it
 POKE_TRIES = 8      # set_volume attempts against the young stream session
 POKE_INTERVAL_S = 1.5
@@ -77,7 +89,22 @@ DEF_ATVREMOTE = os.environ.get(
 QUEUE = "QUEUE"
 PLAY = "PLAY"
 UNQUEUE = "UNQUEUE"
+STOP = "STOP"
 REARM = "REARM"
+
+
+def _service_day(wall, day_start_h=DAY_START_H):
+    """The day-start-to-day-start window that epoch second `wall` falls in.
+
+    Shift the clock back by the start hour and take the LOCAL calendar date:
+    03:00 Tuesday still belongs to Monday's window. Local, so the boundary
+    stays at 05:00 on the wall through both DST switches instead of drifting
+    to 04:00 for half the year. The two hours the DST switch adds to or takes
+    from the night the boundary lives in are hours nobody is in the bathroom;
+    worst case the window is 23h or 25h long, once each per year.
+    """
+    lt = time.localtime(wall - day_start_h * 3600)
+    return (lt.tm_year, lt.tm_yday)
 
 
 def _posture3d_window(frames, baseline):
@@ -99,24 +126,37 @@ POSTURE = {"3d": _posture3d_window, "legacy": None}
 
 
 class SitLatch:
-    """Room-queued one-shot sit trigger with an exit latch (pure, no I/O).
+    """Room-queued sit trigger, latched for the rest of the day (pure, no I/O).
 
-    update() consumes (committed posture, room state, t) once per frame and
-    returns QUEUE (occupancy began: entry sound), PLAY (sit held: main
-    track, once), UNQUEUE (occupancy evaporated with no sit), REARM (exit
-    observed, latch cleared), or None.
+    update() consumes (committed posture, room state, monotonic t, wall clock)
+    once per frame and returns QUEUE (occupancy began: entry sound), PLAY (sit
+    held: the main track, first visit of the day), UNQUEUE (occupancy
+    evaporated with no sit), STOP (the visit that played is over: cut the
+    audio), REARM (the day-start hour passed: latch cleared), or None.
+
+    `t` is monotonic seconds and drives the dwell; `wall` is epoch seconds and
+    ONLY decides which service day it is. Keeping them apart means an NTP step
+    -- the Pi's clock jumps on every boot, before the network is up -- cannot
+    rewrite a sit dwell, and a monotonic clock that knows nothing of 05:00
+    cannot be asked to.
     """
 
-    __slots__ = ("hold", "latched", "_sit_time", "_prev_room", "_last_t")
+    __slots__ = ("hold", "day_start_h", "latched", "_sit_time", "_prev_room",
+                 "_last_t", "_day", "_played")
 
-    def __init__(self, hold=SIT_HOLD_S):
+    def __init__(self, hold=SIT_HOLD_S, day_start_h=DAY_START_H):
         self.hold = hold
+        self.day_start_h = day_start_h
         self.latched = False
         self._sit_time = 0.0     # seconds actually OBSERVED as committed SITTING
         self._prev_room = None
         self._last_t = None
+        self._day = None         # service day the latch was spent on
+        self._played = False     # THIS visit started the main track, so THIS
+                                 # visit's exit has audio to stop
 
-    def update(self, committed, room, t):
+    def update(self, committed, room, t, wall=None):
+        wall = time.time() if wall is None else wall
         prev, self._prev_room = self._prev_room, room
 
         # The dwell counts seconds OBSERVED as sitting. UNKNOWN NEVER touches
@@ -126,10 +166,10 @@ class SitLatch:
         # UNKNOWN, and a dwell that restarted on every gap never reached 2.0s.
         #
         # There is no cap on how long a gap may last. A dwell that survives a
-        # long gap costs nothing: the track is one-shot per occupancy, so the
-        # worst case is one play into a session that already has an occupant,
-        # and the room latch clears on exit anyway. Losing a real sit costs the
-        # entire feature.
+        # long gap costs nothing: the track is one-shot per day, so the worst
+        # case is one play into a session that already has an occupant. Losing
+        # a real sit costs the entire feature -- and now costs it for the whole
+        # day, because nothing rearms until 05:00.
         dt = 0.0 if self._last_t is None else max(0.0, t - self._last_t)
         self._last_t = t
         if committed == State.SITTING_AT_TOILET:
@@ -152,14 +192,31 @@ class SitLatch:
         if room != RoomState.OCCUPIED:
             self._sit_time = 0.0
 
-        # Exit condition: BOTH layers must agree the room is vacated. Room
-        # EMPTY alone must not rearm (a misread under a still-seated body
-        # would rearm-and-replay every frame); posture EMPTY alone must not
-        # rearm (a body out of FOV at the sink/shower is still in the room).
-        if (self.latched and room == RoomState.EMPTY
-                and committed == State.EMPTY):
+        # THE CLOCK IS THE ONLY THING THAT REARMS. Leaving the bathroom used to,
+        # which made the track once-per-visit; it is once-per-day now, so the
+        # latch outlives the visit and only the day boundary clears it. A
+        # restart also comes up clear -- see the module docstring: that is the
+        # whole persistence design, and it is deliberate.
+        #
+        # Checked against _day rather than "is it 05:00 yet", so a boundary that
+        # passes while the daemon is blocked, or a clock that steps over it, is
+        # still seen on the next frame. There is no instant to miss.
+        if self.latched and self._day != _service_day(wall, self.day_start_h):
             self.latched = False
-            return REARM
+            self._day = None
+            return REARM   # deliberately no audio side effect: this can land
+                           # mid-track (05:00 during a sit) and must not cut it
+
+        # Exit condition: BOTH layers must agree the room is vacated. Room
+        # EMPTY alone must not cut the audio (a misread under a still-seated
+        # body would cut mid-sit); posture EMPTY alone must not (a body out of
+        # FOV at the sink/shower is still in the room). Only the visit that
+        # actually started the track has anything to stop, so later visits --
+        # latched, silent -- exit without a word.
+        if (self._played and room == RoomState.EMPTY
+                and committed == State.EMPTY):
+            self._played = False
+            return STOP
 
         if not self.latched:
             # committed SITTING is required, not just a satisfied dwell: with
@@ -168,6 +225,8 @@ class SitLatch:
             if (committed == State.SITTING_AT_TOILET
                     and self._sit_time >= self.hold):
                 self.latched = True
+                self._day = _service_day(wall, self.day_start_h)
+                self._played = True
                 return PLAY
             if room == RoomState.OCCUPIED and prev != RoomState.OCCUPIED:
                 return QUEUE   # occupancy began (or daemon started into it)
@@ -276,9 +335,14 @@ def _log(msg):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Sit-triggered one-shot AirPlay daemon (latched until exit)")
+        description="Sit-triggered AirPlay daemon (one play per day, latch "
+                    "clears at --day-start)")
     ap.add_argument("--hold", type=float, default=SIT_HOLD_S,
                     help="seconds committed SITTING must hold before firing")
+    ap.add_argument("--day-start", type=int, default=DAY_START_H,
+                    metavar="HOUR",
+                    help="local hour the once-a-day latch clears (default %d)"
+                         % DAY_START_H)
     ap.add_argument("--volume", type=int, default=VOLUME,
                     help="HomePod volume %% applied shortly into each play")
     ap.add_argument("--homepod", default=DEF_HOMEPOD, help="HomePod IP")
@@ -290,7 +354,7 @@ def main():
     ap.add_argument("--atvremote", default=DEF_ATVREMOTE,
                     help="path to pyatv's atvremote")
     ap.add_argument("--dry-run", action="store_true",
-                    help="log PLAY/REARM decisions without starting audio")
+                    help="log PLAY/STOP/REARM decisions without starting audio")
     ap.add_argument("--posture", choices=sorted(POSTURE), default="3d",
                     help="posture source: 3d (metric, derived from the current "
                          "baseline) or legacy (classify.py's row bands)")
@@ -318,7 +382,10 @@ def main():
     # alone stick OCCUPIED when someone leaves with the door already open.
     sc = scene_mod.Scene(baseline)
     crossing = threshold.Crossing()
-    latch = SitLatch(hold=args.hold)
+    if not 0 <= args.day_start <= 23:
+        _log("FATAL --day-start must be an hour 0-23, got %d" % args.day_start)
+        return 1
+    latch = SitLatch(hold=args.hold, day_start_h=args.day_start)
     player = Player(args.atvremote, args.homepod, args.volume,
                     dry_run=args.dry_run)
     # one pyatv session: volume set before the stream, and a fade that can
@@ -342,10 +409,14 @@ def main():
                  "~/washlet/venv/bin/python." % sys.executable)
     done = DoneWith()
 
-    _log("washlet daemon up: posture=%s hold=%.1fs vol=%d homepod=%s media=%s queue=%s%s"
+    # Say it out loud at every start: the latch came up CLEAR, and the next sit
+    # plays even if the track already played an hour ago. A restart is a rearm.
+    _log("washlet daemon up: posture=%s hold=%.1fs vol=%d homepod=%s media=%s "
+         "queue=%s%s | latch REARMED by this start; one play per day, clears "
+         "at %02d:00 local"
          % (args.posture, args.hold, args.volume, args.homepod, args.media,
             args.queue_media or "(disabled)",
-            " (DRY RUN)" if args.dry_run else ""))
+            " (DRY RUN)" if args.dry_run else "", args.day_start))
     t0 = None
     last_pub = None
     last_pub_t = 0.0
@@ -407,7 +478,7 @@ def main():
                     fader.fade(seconds=2.0)
                 else:
                     player.stop()
-            action = latch.update(u.committed, ru.room, t)
+            action = latch.update(u.committed, ru.room, t, wall=time.time())
             dry = " (dry run, no audio)" if args.dry_run else ""
             if action == QUEUE:
                 if args.queue_media:
@@ -430,12 +501,16 @@ def main():
                 _log("UNQUEUE occupancy ended with no sit%s"
                      % (", stopping entry sound" if player.running() else ""))
                 player.stop()
-            elif action == REARM:
-                _log("REARM exit observed, latch cleared%s"
-                     % (", stopping player" if player.running() else ""))
+            elif action == STOP:
+                _log("STOP  the played visit ended%s; latch holds until %02d:00"
+                     % (", stopping player" if player.running() else "",
+                        args.day_start))
                 player.stop()
                 if fader is not None:
                     fader.stop()
+            elif action == REARM:
+                _log("REARM %02d:00 local passed, latch cleared for a new day"
+                     % args.day_start)
     except KeyboardInterrupt:
         _log("interrupted; stopping")
         player.stop()

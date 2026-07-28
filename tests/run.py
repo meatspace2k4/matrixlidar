@@ -25,7 +25,7 @@ ROOT = os.path.dirname(HERE)
 # frame, per frame, against the operator's own per-frame labels.
 SCRIPTS = ["test_classify.py", "test_pipeline.py", "test_crossing.py",
            "test_depth.py", "test_scene_engine.py", "test_replay_sessions.py",
-           "test_occlusion.py", "test_seated.py"]
+           "test_occlusion.py", "test_seated.py", "test_washlet.py"]
 GATES = [
     ["python3", "-m", "bathroom.validate", "--predictor", "engine", "--no-clips", "--min-accuracy", "1.0"],
     ["python3", "-m", "bathroom.validate", "--predictor", "frame", "--no-clips", "--min-accuracy", "1.0"],
