@@ -25,6 +25,15 @@ Decisions:
 - REARM: --day-start (05:00) passes -> clear the latch. This is the ONLY
   clock-driven decision, and the only thing that rearms a running daemon.
 
+IR is recorded, never obeyed. The daemon opens the Pi's local receiver
+(bathroom/ir.py; absent hardware is logged once and costs nothing) and every
+frame FINGERPRINT is printed and MARKed into the session archive on the
+lidar server, where it persists with the session and comes back out of
+replay.py. Signals arriving on the stream as "IR <json>" lines
+(a replayed clip's recorded log) are printed the same way. Neither source
+triggers audio or touches the latch: the remote is not a control surface for
+this daemon, it is something the room heard.
+
 Every stream start gets the volume poke (a second atvremote, retried
 across the startup window because a set accepted mid-handshake can be
 overridden when audio starts); the session's own starting volume is
@@ -48,7 +57,7 @@ import time
 
 from collections import deque
 
-from . import archive, classify, config, detect, occupancy, player as player_mod, posture3d, scene as scene_mod, stream, threshold
+from . import archive, classify, config, detect, ir as ir_mod, occupancy, player as player_mod, posture3d, scene as scene_mod, stream, threshold
 from .donewith import DoneWith, FADE
 from .engine import StateEngine
 from .live import DRIFT_FRAMES, _direction
@@ -399,6 +408,12 @@ def main():
     # made read-only the archive went silent. A false SITTING at 13:37:05 burned
     # the play latch and left no frame to replay.
     marker = archive.Marker()
+    # The room's own IR receiver. This daemon runs on the Pi the sensor is
+    # wired to, so it is the process that hears the remote; what it hears goes
+    # into the same session archive as the transitions, via the marker.
+    irx = ir_mod.Receiver()
+    irx.start()
+    _log("ir: %s" % ir_mod.describe(irx.source))
     fader = None
     if not args.dry_run:
         if player_mod.available():
@@ -466,6 +481,23 @@ def main():
                      "door": None if door.pct is None else round(door.pct),
                      "occ": u.features["occ_count"],
                      "dir": _direction(col_hist).strip()}))
+
+            # IR from two sources, one treatment: print the fingerprint, mark
+            # into the session archive, trigger nothing. The local receiver is
+            # the live bathroom (this daemon runs on the Pi the sensor is wired
+            # to); the stream's "IR <json>" lines are a replayed clip's
+            # recorded log arriving from evals/stub_pi.py. The live server
+            # sends no IR lines, so nothing is heard twice.
+            for ev in irx.drain():
+                # kernel wall timestamp -> engine t, anchored on this frame:
+                # the event is (now - its ts) old, and the frame is at t
+                ev_t = t - max(0.0, time.time() - ev["ts"])
+                _log("IR    t=%7.2fs  %s" % (ev_t, ir_mod.format_event(ev)))
+                marker.ir(ev, ev_t)
+            for ev in stream.drain_ir():
+                ev_t = ev.get("t", t)
+                _log("IR    t=%7.2fs  %s" % (ev_t, ir_mod.format_event(ev)))
+                marker.ir(ev, ev_t)
 
             rc = player.reap()
             if rc is not None:

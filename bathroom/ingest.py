@@ -9,7 +9,9 @@ artifacts into one shape:
 
 Sources understood:
   fixtures/labeled/*.json   schema bathroom-labeled/1 (seed single frames)
-  data/clips/*.json         schema bathroom-clip/1 (recorded time series)
+  data/clips/*.json         schema bathroom-clip/1 or /2 (recorded time
+                            series; /2 also carries an IR log, which this
+                            reads nothing from -- it trains on frames)
 
 Both store frames as flat row-major oriented `mm` arrays; we reshape to 8x8.
 `state` is the normalized ground truth (None if the label is unrecognized, so

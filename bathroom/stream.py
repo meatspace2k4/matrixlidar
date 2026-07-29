@@ -8,10 +8,17 @@ port is never stolen from the server (unlike the direct-serial snapshot tool).
 
 `frames()` yields oriented matrices (display orientation, row 0 = top, col 0 =
 column A) and transparently reconnects if the Pi reboots or the link drops.
+
+Two other line types share the stream and are NOT frames: "STATE <json>" (the
+detection daemon's published state, a level) and "IR <json>" (a decoded IR
+signal, an event). Both are consumed here and handed on through `state()` and
+`drain_ir()` rather than reaching the frame consumer.
 """
 import json
 import socket
 import time
+
+from collections import deque
 
 from .zones import N
 
@@ -32,6 +39,24 @@ _sock = None       # the socket frames() is currently reading (for send())
 last_state = None     # dict from the daemon's most recent STATE line
 last_state_ts = None  # time.time() when it arrived
 STATE_STALE_S = 5.0   # daemon heartbeats at 1s; older than this means no feed
+
+# Decoded IR signals arriving as "IR <json>" lines on the same stream. A
+# QUEUE, not a `last_ir`: STATE is a level (the newest one is the truth and
+# missing one costs nothing) and an IR signal is an EVENT (each one is a
+# distinct press, and dropping one loses it). Bounded, so a consumer that
+# never drains cannot grow it without limit -- it just keeps the newest.
+IR_QUEUE_MAX = 256
+_ir = deque(maxlen=IR_QUEUE_MAX)
+
+
+def drain_ir():
+    """Every IR signal received since the last call, oldest first."""
+    out = []
+    while True:
+        try:
+            out.append(_ir.popleft())
+        except IndexError:
+            return out
 
 
 def state():
@@ -118,6 +143,12 @@ def frames(host=HOST, port=PORT, on_wait=None):
                         try:
                             last_state = json.loads(line[6:])
                             last_state_ts = time.time()
+                        except ValueError:
+                            pass
+                        continue
+                    if line.startswith("IR "):
+                        try:
+                            _ir.append(json.loads(line[3:]))
                         except ValueError:
                             pass
                         continue

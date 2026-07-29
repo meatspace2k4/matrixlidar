@@ -1,0 +1,72 @@
+# Washlet jukebox. Runs as `washlet`, a nologin system account.
+#
+# Install: deploy/migrate-to-service-accounts.sh (as root)
+# Logs:    journalctl -u washlet -f
+[Unit]
+Description=Washlet jukebox (sit-triggered AirPlay, one play per day)
+Wants=network-online.target
+After=network-online.target lidar-server.service
+
+[Service]
+ExecStart=/opt/washlet/venv/bin/python -m bathroom.washlet
+WorkingDirectory=/opt/washlet/matrixlidar
+User=washlet
+Group=washlet
+# /dev/lirc0 is root:video. This is the whole reason the account needs a
+# supplementary group at all; the IR path needs no root and no ir-keytable.
+SupplementaryGroups=video
+Restart=always
+RestartSec=2
+
+# NOT optional. bathroom/washlet.py defaults these to os.path.expanduser
+# ("~/washlet/..."), and a --system account created with --no-create-home
+# has no home to expand. Running the daemon out of the relocated tree
+# without these printed
+#   media=/home/jpark/washlet/media/days_of_blues.mp3
+# which does not exist for this account and is not readable by it in any
+# case (ProtectHome=yes, and /home/jpark is 0700). Non-dry-run startup
+# checks the file and exits 1 on a miss, so this would fail at boot.
+Environment=WASHLET_MEDIA=/opt/washlet/media/days_of_blues.mp3
+Environment=WASHLET_ATVREMOTE=/opt/washlet/venv/bin/atvremote
+
+# --- containment -------------------------------------------------------
+# Reads frames from lidar-server, reads the IR receiver, streams to the
+# HomePod. It writes nothing to disk, so nothing here is writable.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# AF_NETLINK is not decoration: pyatv's zeroconf enumerates interfaces
+# through getifaddrs, which is a netlink socket underneath. Drop it and
+# the AirPlay scan fails at connect time, not at start, which is the worst
+# way to find out.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# The IR receiver, read-only. No serial port, no anything else.
+DevicePolicy=closed
+DeviceAllow=/dev/lirc0 r
+UMask=0077
+
+# MemoryDenyWriteExecute is deliberately NOT set here, unlike lidar-server.
+# pyatv pulls in cryptography and its compiled backends; W^X is the classic
+# way to break that class of dependency at runtime rather than at start.
+# Turn it on only after watching a full play succeed with it.
+
+[Install]
+WantedBy=multi-user.target

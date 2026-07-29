@@ -1,6 +1,7 @@
 """Load recorded clips for training and inspect the corpus.
 
-A clip on disk is a self-describing JSON (schema bathroom-clip/1). This turns
+A clip on disk is a self-describing JSON (schema bathroom-clip/1, or /2 with
+an IR log alongside the frames; the frame fields are identical). This turns
 clips into arrays a transformer can consume and provides the corpus tooling
 the operator needs before training: class distribution, a deterministic
 train/val split, and a vocabulary export.
