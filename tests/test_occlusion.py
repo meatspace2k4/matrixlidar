@@ -103,12 +103,13 @@ def _occupied_engine():
     interior_frame = make_frame(*interior_cells)
 
     # These scenarios are about what happens WHILE the room is occupied, not
-    # about how it got that way. It becomes occupied by the sensor SEEING a
-    # body, which is now sufficient; it used to be driven through the old
-    # doorway-then-interior inference, and that model is gone.
+    # about how it got that way. Occupancy is entered only by an observed
+    # ENTRY crossing now (the field never latches it), so the setup states
+    # the precondition directly instead of synthesizing a crossing that is
+    # not under test here.
     t = 0.0
     t, _ = drive(eng, t, [(interior_frame, SceneParams.DEBOUNCE_N * 3)])
-    assert eng.room == RoomState.OCCUPIED, "setup: engine not OCCUPIED"
+    eng._set_room(RoomState.OCCUPIED, 1, t)
     return eng, t
 
 

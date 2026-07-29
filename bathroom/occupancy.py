@@ -1,16 +1,10 @@
 """Room occupancy: is anyone in the bathroom.
 
-Two inputs, and both of them measure a BODY:
+One input: bathroom/threshold.py, did a body cross the door plane, and which
+way. That is the whole model.
 
-  bathroom/posture3d.py    is there a body in the field
-  bathroom/threshold.py  did a body cross the door plane, and which way
-
-That is the whole model.
-
-  a body is in the field                -> OCCUPIED. Seeing someone is direct
-                                           evidence that someone is there.
-  a body crossed the plane outward      -> EMPTY. The door is the only way out.
   a body crossed the plane inward       -> OCCUPIED.
+  a body crossed the plane outward      -> EMPTY. The door is the only way out.
   the view is BLOCKED                   -> HOLD, and say so. Something over the
                                            sensor (a towel, a coat on the hook,
                                            a hand) kills the returns across the
@@ -18,44 +12,43 @@ That is the whole model.
                                            evidence of anything, least of all
                                            of an empty room, so nothing is
                                            decided off it.
-  the field is empty, nothing crossed   -> HOLD. THE FIELD IS NOT THE ROOM. It
-                                           does not cover the sink or the tub,
-                                           so a body that walks out of the
-                                           FIELD, off to the left, has not left
-                                           the ROOM. Only a crossing empties it.
+  anything else                         -> HOLD.
 
-WHAT THIS REPLACES, AND WHY IT WAS WRONG
+The room has ONE door and the sensor points at it. A body cannot be in the
+room without having crossed the plane inward in view of the sensor, and it
+cannot leave except back out through the same plane. So the crossing is the
+only occupancy evidence there is, in both directions, and the field holds no
+veto: a body the field stops seeing is at the sink or in the tub, not gone,
+and a posture flicker in a room with no observed ENTRY is a misread, not a
+person.
 
-The previous engine reduced each frame to {interior_body, doorway_body} with
-scene.read_frame and ran a doorway automaton over that. Three things were
-broken at once, and each one hid the others:
+THE FIELD USED TO LATCH OCCUPANCY (the PRESENCE event), on the argument that
+seeing someone is direct evidence. It also latched off seeing no one: one
+committed 1.0s STANDING flicker in an empty room latched OCCUPIED, and since
+clearing required an EXIT crossing that no one was there to make, it held for
+hours (07-29 11:29, live). Debouncing the latch shrinks that window; it
+cannot close it, and a false OCCUPIED has no recovery path by design. The
+latch is gone instead. Detection errors are detection bugs, to be fixed in
+the classifier, not absorbed as room state.
 
-- INTERIOR PRESENCE COULD NOT LATCH OCCUPANCY. A body seen in the room with no
-  observed entry was reported as PRESENCE_NO_ENTRY and the room stayed UNKNOWN.
-  So the operator sat on the toilet in full view of the sensor and the room
-  line read `UNKNOWN(0) 8m31s`. UNKNOWN is not the cautious answer when a
-  person is visibly sitting there, it is a wrong one that declines to commit.
+The cost: a body already inside when the daemon starts (or seen only after a
+stream gap) is not OCCUPIED until its exit is seen, because its entry was
+never observed. That body still gets its audio: the washlet's sit trigger
+runs on posture, not on room state.
 
-- interior_body COULD NOT SEE A SEATED BODY. It wanted 7 cells reading 300mm
-  nearer than the empty room, and a seated body is mostly a HOLE: the beam goes
-  out where the scan found a surface and nothing comes back. posture.py counts
-  those, so this does too, by asking posture.py.
-
-- ENTRY AND EXIT WERE INFERRED FROM THE DOOR. Doorway-band cells followed by
-  interior cells meant ENTERED. This door opens outward, the sensor looks
-  straight through the frame into the hallway, and it can be opened and shut
-  from the hallway by someone who never comes in, so the panel is not a proxy
-  for a person. It is a body crossing a fixed plane now: the sign of its
-  distance to a plane derived from the scan, confirmed by travel across it.
+ENTRY AND EXIT were once inferred from the DOOR PANEL. This door opens
+outward, the sensor looks through the frame into the hallway, and the panel
+can be operated from either side by someone who never comes in, so the panel
+is not a proxy for a person. The crossing is a body crossing a fixed plane:
+the sign of its distance to a plane derived from the scan, confirmed by
+travel across it. door_pct stays telemetry, never evidence.
 
 UNKNOWN survives for one thing only: before anything has been observed, and
-after a stream gap long enough that nothing about the room can be attested. It
-is never used to avoid committing to what the sensor can plainly see.
+after a stream gap long enough that nothing about the room can be attested.
 """
 from . import roomscan, threshold
-from .engine import StateEngine
 from .scene import Params as SceneParams
-from .zones import N, NO_TARGET, State
+from .zones import N, NO_TARGET
 
 
 class RoomState:
@@ -78,7 +71,7 @@ class RoomUpdate:
     def __init__(self, room, occupants, event, since, blocked=False):
         self.room = room            # externally reported RoomState.*
         self.occupants = occupants  # 0 unless OCCUPIED
-        self.event = event          # ENTRY_CONFIRMED/EXIT/PRESENCE/GAP_RESET
+        self.event = event          # ENTRY_CONFIRMED/EXIT/GAP_RESET/OCCLUDED
         self.since = since          # t when the reported room state last changed
         self.blocked = blocked      # the view is occluded NOW (level, not edge)
 
@@ -104,25 +97,8 @@ class OccupancyEngine:
         self.baseline = baseline
         self._scene = roomscan.Scene(baseline)
         self._crossing = threshold.Crossing()
-        # the DEBOUNCED posture, not the raw per-frame verdict. A handful of
-        # frames of an empty room read as a body (5 of 111 in the walk-through
-        # capture), and latching occupancy off one of those put the room back
-        # to OCCUPIED a second after the operator had walked out. The temporal
-        # engine already exists to absorb exactly that; occupancy had been
-        # re-deciding per frame beside it.
-        self._posture = StateEngine(baseline=baseline)
         self._blocked_run = 0
         self._blocked_said = False
-        # when the last outward crossing happened. A body walking OUT through
-        # the plane is still a body in the field on those same frames, so
-        # PRESENCE re-latched OCCUPIED one frame after the EXIT and the room
-        # said occupied with the bathroom empty. Observed live at 13:38:12:
-        #   room -> EMPTY     (EXIT)
-        #   room -> OCCUPIED  (PRESENCE)
-        # After a crossing out, presence has to see the field go clear before it
-        # may latch again.
-        self._exited_at = None
-        self._clear_since_exit = False
         # how many rays the SCAN itself answered. A ray it could not answer
         # (the whole door column, with the door open when the scan was taken)
         # says nothing about the view being blocked either, so the blocked test
@@ -153,12 +129,9 @@ class OccupancyEngine:
         if self._last_t is not None and t - self._last_t > Params.T_GAP:
             # unobserved stretch: nothing about the room can be attested
             self._set_room(RoomState.UNKNOWN, 0, t)
-            # the crossing history AND the posture debounce are both stale: a
-            # body committed before the gap is not evidence of a body after it,
-            # and holding that history reported the pre-gap occupant on the
-            # first frame back.
+            # the crossing history is stale: a body committed before the gap
+            # is not evidence of a body after it
             self._crossing = threshold.Crossing()
-            self._posture = StateEngine(baseline=self.baseline)
             event = "GAP_RESET"
         self._last_t = t
 
@@ -184,8 +157,6 @@ class OccupancyEngine:
         if crossed == threshold.EXIT:
             # exits are deltas and cannot be attributed, so the count zeroes
             self._set_room(RoomState.EMPTY, 0, t)
-            self._exited_at = t
-            self._clear_since_exit = False
             return RoomUpdate(self.room, self.occupants, "EXIT", self.since)
         if crossed == threshold.ENTRY:
             n = self.occupants + 1 if self.room == RoomState.OCCUPIED else 1
@@ -193,22 +164,14 @@ class OccupancyEngine:
             return RoomUpdate(self.room, self.occupants, "ENTRY_CONFIRMED",
                               self.since)
 
-        state = self._posture.update(matrix, t).committed
-        if state == State.EMPTY:
-            self._clear_since_exit = True
-        if state != State.EMPTY:
-            # a body is in the field. That is the whole argument, EXCEPT
-            # immediately after an outward crossing: the departing body is still
-            # in the field on those frames, and re-latching off it is how the
-            # room ended up occupied with nobody in it.
-            if self._exited_at is not None and not self._clear_since_exit:
-                return RoomUpdate(self.room, self.occupants, event, self.since)
-            if self.room != RoomState.OCCUPIED:
-                self._set_room(RoomState.OCCUPIED, 1, t)
-                event = "PRESENCE"
-            return RoomUpdate(self.room, self.occupants, event, self.since)
-
-        # The field is empty, which is NOT an empty room. Hold what it was.
+        # No crossing this frame. Hold. The field never decides the room:
+        # OCCUPIED is entered by an ENTRY crossing and left by an EXIT
+        # crossing, nothing else. The room has one door and the sensor points
+        # at it, so a body cannot be in here without having crossed inward in
+        # view, and a body the field stops seeing is at the sink or in the
+        # tub, not gone. A posture flicker in an empty room is a misread, and
+        # under the old PRESENCE rule one 1.0s flicker latched OCCUPIED with
+        # no way back (07-29 11:29, held for hours).
         return RoomUpdate(self.room, self.occupants, event, self.since)
 
 

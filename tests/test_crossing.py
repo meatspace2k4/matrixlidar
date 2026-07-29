@@ -30,13 +30,17 @@ CASES = [
      ["ENTRY_CONFIRMED", "EXIT", "ENTRY_CONFIRMED", "EXIT"], RoomState.EMPTY),
     ("sitting_1785074559", "walk in, sit 20s, leave",
      ["ENTRY_CONFIRMED"], RoomState.OCCUPIED),      # the capture ends seated
-    # These two open with the operator already at the toilet, so no crossing is
-    # ever observed. The room is OCCUPIED anyway, because the sensor can SEE
-    # them. They used to report UNKNOWN(0) with a body in plain view.
+    # These two open with the operator already at the toilet, so no crossing
+    # is ever observed and the room stays UNKNOWN. That is the model: the
+    # crossing is the only occupancy evidence, in both directions. The field
+    # briefly latched these OCCUPIED (the PRESENCE event), and the same rule
+    # latched an EMPTY room off a 1.0s posture flicker with no recovery path
+    # (07-29 11:29, held for hours). The body here still gets its audio: the
+    # washlet sit trigger runs on posture, not room state.
     ("sitting_1784950347", "upright, back against tank",
-     [], RoomState.OCCUPIED),
+     [], RoomState.UNKNOWN),
     ("standing_1784950390", "standing at the toilet, not the mirror",
-     [], RoomState.OCCUPIED),
+     [], RoomState.UNKNOWN),
 ]
 
 FAILS = []
