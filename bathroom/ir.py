@@ -87,6 +87,21 @@ QUEUE_MAX = 4096       # an undrained receiver leaks nothing worse than this
 RC_CLASS = "/sys/class/rc"
 
 
+# Buttons identified so far, fingerprint -> name. Named from charted ring
+# sessions where the operator attested which button was pressed. A
+# fingerprint not in here is a real frame from a button nobody has named yet;
+# nothing gates on this map, it only labels output.
+BUTTONS = {
+    "40:a00800f6f6": "SEAT2",
+    "40:a008008888": "FLUSH2",
+}
+
+
+def button_name(fp):
+    """The named button for a fingerprint, or the fingerprint itself."""
+    return BUTTONS.get(fp, fp)
+
+
 def _want_bits():
     """The read-time gate width from the environment.
 

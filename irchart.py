@@ -143,12 +143,14 @@ def render(t0, t1, move, states, irs, width, title):
     lines.append("       %-*s%s" % (width // 2, "0.0s", "%.1fs" % (t1 - t0)))
 
     lines.append("")
-    lines.append(" #  t         fp                n  state at press")
+    lines.append(" #  t         button   fp                n  state at press")
     for t, fp, n, frag in presses:
         tag = "x" if frag else IDX[fps.index(fp) % len(IDX)]
         rep = "+%d rpt" % n if n else ""
-        lines.append(" %s  %8.2fs  %-16s %-6s %s%s"
-                     % (tag, t - t0, fp, rep, _state_at(states, t),
+        name = ir_mod.button_name(fp)
+        lines.append(" %s  %8.2fs  %-8s %-16s %-6s %s%s"
+                     % (tag, t - t0, "" if name == fp else name, fp, rep,
+                        _state_at(states, t),
                         "  (fragment)" if frag else ""))
     if not presses:
         lines.append("    (no ir in this source)")
