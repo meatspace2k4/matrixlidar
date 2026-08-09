@@ -120,7 +120,13 @@ class Params:
     # historical frames across 11 sessions, plus a 148-frame live sample, all
     # below 40), while the churn-window frames carry 40-59 with only 3-17
     # survivors sitting at 673-824mm. 32 sits in that gap, at half the field.
-    MAX_NO_TARGET = 32       # more no-target cells than this => view blocked
+    MAX_NO_TARGET = 63       # OCCLUSION MEANS THE ENTIRE SENSOR IS COVERED:
+                             # only a frame with every cell dead is a blocked
+                             # view. Anything less is a scene with a body in
+                             # it; deciding which dead cells are body and
+                             # which are blockage is not this module's call,
+                             # and the old half-field rule doing so is what
+                             # blinded the exit crossing (08-09 13:58).
     # door panel classification (informational only):
     PANEL_OPEN = 1.35        # H reading >= this * baseline -> hallway seen
     PANEL_CLOSED_HI = 1.12   # H median within [0.95, this] * baseline

@@ -5,13 +5,12 @@ way. That is the whole model.
 
   a body crossed the plane inward       -> OCCUPIED.
   a body crossed the plane outward      -> EMPTY. The door is the only way out.
-  the view is BLOCKED                   -> HOLD, and say so. Something over the
-                                           sensor (a towel, a coat on the hook,
-                                           a hand) kills the returns across the
-                                           whole field. That frame is not
-                                           evidence of anything, least of all
-                                           of an empty room, so nothing is
-                                           decided off it.
+  the view is BLOCKED                   -> HOLD, and say so. Blocked means
+                                           the ENTIRE field is dead: a towel
+                                           over the unit kills every ray the
+                                           scan can answer. A frame with any
+                                           ray answering is a scene, never an
+                                           occlusion, however close the body.
   anything else                         -> HOLD.
 
 The room has ONE door and the sensor points at it. A body cannot be in the
@@ -57,8 +56,18 @@ class RoomState:
     OCCUPIED = "OCCUPIED"
 
 
-BLOCKED_FRACTION = 0.5   # more than half the rays the scan answers coming back
-                         # dead is not an empty room, it is a blocked view
+BLOCKED_FRACTION = 1.0   # OCCLUSION MEANS THE ENTIRE SENSOR IS COVERED:
+                         # every ray the scan can answer coming back dead is
+                         # a towel over the unit. Anything less is a scene
+                         # with a body in it, and this engine does not decide
+                         # which cells are body and which are blockage. The
+                         # old half-coverage rule did exactly that, and it
+                         # switched the crossing off at the worst possible
+                         # moment: a body passing the sensor on its way OUT
+                         # drops most rays under minimum range, the frame
+                         # read "blocked", and the exit swept past unseen
+                         # (08-09 13:58; the room stayed OCCUPIED with
+                         # nobody in it).
 
 
 class Params:
@@ -142,7 +151,7 @@ class OccupancyEngine:
         dead = sum(1 for r in range(N) for c in range(N)
                    if matrix[r][c] >= NO_TARGET
                    and self.baseline[r][c] < NO_TARGET)
-        if self._answerable and dead > BLOCKED_FRACTION * self._answerable:
+        if self._answerable and dead >= BLOCKED_FRACTION * self._answerable:
             self._blocked_run += 1
             debounced = self._blocked_run > SceneParams.DEBOUNCE_N
             if debounced and not self._blocked_said:

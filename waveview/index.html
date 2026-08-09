@@ -1,0 +1,327 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>waveview</title>
+<style>
+  body { background:#0d0d14; color:#ccc; font-family:monospace; margin:16px; }
+  canvas { background:#16161e; display:block; }
+  #diag { margin-top:8px; white-space:pre; color:#8a8; }
+  button { font-family:monospace; margin-top:8px; }
+</style>
+<canvas id="cv"></canvas>
+<button id="flat">2D mode (rotation -> 0; same render path)</button>
+<div id="diag"></div>
+<script>
+"use strict";
+/* waveview: a TERMINAL EMULATOR whose framebuffer is 3D geometry.
+
+   The dev server runs the real heatmap_client.py and forwards its raw ANSI
+   repaints (SCREEN lines on the feed). This page parses those bytes the way
+   a terminal does -- cursor home, SGR colors, erase-to-EOL -- into a grid of
+   character cells, and the grid IS the scene: every cell is a quad carrying
+   its glyph, and the cells inside the heatmap region are BARS, extruded
+   backward by the mm their ray measured (taken from the same frame lines the
+   real client consumed). Nothing on screen is drawn from screenshot mimicry;
+   if the client's output changes, this page changes with it, because it is
+   rendering the same bytes.
+
+   The whole terminal is ONE assembly in scene space. It faces the fixed
+   orthographic camera at rotation zero, which is why the default pose is
+   indistinguishable from the flat TUI; dragging rotates the ASSEMBLY and the
+   bars come out of it. The camera below is frozen at identity and is never
+   written. No objects, no classes, no libraries. */
+
+/* ---- scene config (custom compact format; fail loud) ---- */
+var CFG = null;
+function parseCfg(text) {
+  var cfg = {};
+  var lines = text.split("\n");
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].split("#")[0].trim();
+    if (!line) continue;
+    var tk = line.split(/\s+/);
+    cfg[tk[0]] = tk.slice(1).map(Number);
+  }
+  var need = ["ch","canvas","depth","fov","trail","grid"];
+  for (var n = 0; n < need.length; n++)
+    if (!(need[n] in cfg)) throw new Error("scene.cfg missing: " + need[n]);
+  return cfg;
+}
+
+/* ---- fixed camera: orthographic, identity, never reassigned ---- */
+var CAMERA = Object.freeze({ kind:"ortho", rot:Object.freeze([0,0]) });
+var scenePose = { rx: 0, ry: 0 };   /* what dragging changes: the assembly */
+
+/* ---- the terminal ---- */
+var COLS = 80, ROWS = 26;
+var DEF_FG = "#e8e8e8", DEF_BG = null;
+var term = [];        /* [row][col] = {ch, fg, bg, bold} */
+function termClear() {
+  term = [];
+  for (var r = 0; r < ROWS; r++) { term.push([]);
+    for (var c = 0; c < COLS; c++)
+      term[r].push({ch:" ", fg:DEF_FG, bg:DEF_BG, bold:false}); }
+}
+termClear();
+
+/* Parse one repaint of ANSI exactly as a terminal would. Handles the
+   sequences the client emits: [H home, [2J clear, [K erase-to-EOL,
+   [?25l/h cursor, and SGR m codes (0 reset, 1 bold, 30/97 fg,
+   48;2;r;g;b truecolor bg). Anything else in the stream is a bug in this
+   emulator: throw, do not skip quietly. */
+function feedAnsi(s) {
+  var cx = 0, cy = 0, fg = DEF_FG, bg = DEF_BG, bold = false;
+  var i = 0;
+  while (i < s.length) {
+    var ch = s[i];
+    if (ch === "\x1b") {
+      if (s[i+1] !== "[") throw new Error("ansi: ESC without [ at " + i);
+      var j = i + 2, params = "";
+      while (j < s.length && !/[A-Za-z]/.test(s[j])) { params += s[j]; j++; }
+      var letter = s[j];
+      if (letter === "H") { cx = 0; cy = 0; }
+      else if (letter === "J") { termClear(); cx = 0; cy = 0; }
+      else if (letter === "K") {
+        for (var k = cx; k < COLS; k++)
+          term[cy][k] = {ch:" ", fg:DEF_FG, bg:DEF_BG, bold:false};
+      }
+      else if (letter === "l" || letter === "h") { /* cursor vis: no cells */ }
+      else if (letter === "m") {
+        var ps = params === "" ? ["0"] : params.split(";");
+        for (var p = 0; p < ps.length; p++) {
+          var v = parseInt(ps[p] || "0", 10);
+          if (v === 0) { fg = DEF_FG; bg = DEF_BG; bold = false; }
+          else if (v === 1) bold = true;
+          else if (v === 30) fg = "#1e1e1e";
+          else if (v === 97) fg = "#f4f4f4";
+          else if (v === 48 && ps[p+1] === "2") {
+            bg = "rgb(" + ps[p+2] + "," + ps[p+3] + "," + ps[p+4] + ")";
+            p += 4;
+          }
+          else throw new Error("ansi: unhandled SGR " + ps[p]);
+        }
+      }
+      else throw new Error("ansi: unhandled CSI " + letter);
+      i = j + 1;
+      continue;
+    }
+    if (ch === "\n") { cy++; cx = 0; i++; if (cy >= ROWS) cy = ROWS - 1; continue; }
+    if (ch === "\r") { cx = 0; i++; continue; }
+    if (cx < COLS && cy < ROWS)
+      term[cy][cx] = {ch:ch, fg:fg, bg:bg, bold:bold};
+    cx++; i++;
+  }
+}
+
+/* ---- frame data: same wire lines the client consumed, for the depth ---- */
+var N = 8, NO_TARGET = 4000;
+var HOLD_FRAMES = 6;
+var hold = [], stale = [];
+for (var r0 = 0; r0 < N; r0++) { hold.push([]); stale.push([]);
+  for (var c0 = 0; c0 < N; c0++) { hold[r0].push(NO_TARGET); stale[r0].push(7); } }
+var trail = [];
+function orient(raw) {                  /* orient(raw)[r][c] == raw[c][N-1-r] */
+  var m = [];
+  for (var r = 0; r < N; r++) { m.push([]);
+    for (var c = 0; c < N; c++) m[r].push(raw[c][N-1-r]); }
+  return m;
+}
+function lift(r, c, mm) {               /* ray direction x distance: the 3D */
+  var fov = CFG.fov[0] * Math.PI / 180; /* lift bathroom/wave4d.py also does */
+  var thx = ((c + 0.5) / N - 0.5) * fov, thy = ((r + 0.5) / N - 0.5) * fov;
+  return { x: Math.tan(thx)*mm, y: Math.tan(thy)*mm, z: mm };
+}
+function onLine(line) {
+  if (line.indexOf("SCREEN ") === 0) { feedAnsi(JSON.parse(line.slice(7))); return; }
+  if (line.indexOf("STATE ") === 0 || line.indexOf("IR ") === 0) return;
+  var parts = line.split(",");
+  if (parts.length !== N*N) return;
+  var flat = parts.map(Number), raw = [];
+  for (var i = 0; i < N; i++) raw.push(flat.slice(i*N, (i+1)*N));
+  var m = orient(raw);
+  var sr=0, sc=0, sz=0, k=0;
+  for (var r = 0; r < N; r++) for (var c = 0; c < N; c++) {
+    var v = m[r][c];
+    if (v > 0 && v < NO_TARGET) { hold[r][c] = v; stale[r][c] = 0; }
+    else stale[r][c]++;
+    if (v > 0 && v < 700) { var p = lift(r,c,v); sr+=r; sc+=c; sz+=p.z; k++; }
+  }
+  if (k >= 2) {
+    trail.push({r:sr/k, c:sc/k, z:sz/k});
+    if (trail.length > CFG.trail[0]) trail.shift();
+  } else if (trail.length) trail.shift();
+}
+
+/* ---- the one render path ----
+   Terminal grid -> primitive list in scene space -> rotate assembly ->
+   painter sort -> draw. Bars and glyph runs go through the same transform. */
+function rotp(p, cx, cy, cz) {
+  var x = p[0]-cx, y = p[1]-cy, z = p[2]-cz;
+  var cyr = Math.cos(scenePose.ry), syr = Math.sin(scenePose.ry);
+  var x1 = x*cyr + z*syr, z1 = -x*syr + z*cyr;
+  var cxr = Math.cos(scenePose.rx), sxr = Math.sin(scenePose.rx);
+  var y1 = y*cxr - z1*sxr, z2 = y*sxr + z1*cxr;
+  return [x1+cx, y1+cy, z2+cz];
+}
+function darken(css, f) {
+  var m = /rgb\((\d+),(\d+),(\d+)\)/.exec(css);
+  if (!m) return css;
+  return "rgb(" + [1,2,3].map(function(i){ return Math.round(+m[i]*f); }).join(",") + ")";
+}
+
+var MAXZ = null;   /* the back plane: NO_TARGET at depth scale (set on load) */
+function cellZ(row, col) {
+  /* z of this char cell's FRONT FACE. The interface itself lives at z=0 and
+     nothing may cross it (the 4th wall): a return of D mm puts its face at
+     D*depth INTO the screen, so nearer returns rise FORWARD out of the
+     common back plane toward the glass, capped by it. Outside the heatmap
+     region the cell is the glass: z=0, no bar. */
+  var g = CFG.grid;
+  var r = row - g[1], c = Math.floor((col - g[0]) / g[2]);
+  if (r < 0 || r >= N || c < 0 || c >= N || col < g[0] || col >= g[0]+N*g[2])
+    return 0;
+  var v = stale[r][c] <= HOLD_FRAMES ? hold[r][c] : NO_TARGET;
+  return (v >= NO_TARGET ? NO_TARGET : v) * CFG.depth[0];
+}
+
+function buildPrims() {
+  var chw = CFG.ch[0], chh = CFG.ch[1], prims = [];
+  /* background runs: merge adjacent same-bg same-depth cells per row into
+     one bar (front + 4 sides when extruded) */
+  for (var row = 0; row < ROWS; row++) {
+    var col = 0;
+    while (col < COLS) {
+      var cell = term[row][col];
+      var zf = cellZ(row, col);
+      var end = col;
+      while (end < COLS && term[row][end].bg === cell.bg
+             && cellZ(row, end) === zf) end++;
+      if (cell.bg !== null) {
+        var x0 = col*chw, x1 = end*chw, y0 = row*chh, y1 = (row+1)*chh;
+        var A=[x0,y0,zf], B=[x1,y0,zf], C=[x1,y1,zf], D=[x0,y1,zf];
+        if (zf > 0 && zf < MAXZ) {      /* a bar: face forward of the back plane */
+          var A2=[x0,y0,MAXZ], B2=[x1,y0,MAXZ], C2=[x1,y1,MAXZ], D2=[x0,y1,MAXZ];
+          prims.push({t:"quad", p:[A2,B2,C2,D2], fill:darken(cell.bg,0.45)});
+          prims.push({t:"quad", p:[A,B,B2,A2], fill:darken(cell.bg,0.72)});
+          prims.push({t:"quad", p:[D,C,C2,D2], fill:darken(cell.bg,0.55)});
+          prims.push({t:"quad", p:[A,D,D2,A2], fill:darken(cell.bg,0.66)});
+          prims.push({t:"quad", p:[B,C,C2,B2], fill:darken(cell.bg,0.60)});
+        }
+        prims.push({t:"quad", p:[A,B,C,D], fill:cell.bg});
+      }
+      col = end;
+    }
+    /* glyph runs: same fg/bold AND same face depth, so a cm number rides
+       the front face of its own bar */
+    col = 0;
+    while (col < COLS) {
+      var c2 = term[row][col];
+      if (c2.ch === " ") { col++; continue; }
+      var z2 = cellZ(row, col);
+      var e2 = col, s = "";
+      while (e2 < COLS && term[row][e2].fg === c2.fg
+             && term[row][e2].bold === c2.bold
+             && cellZ(row, e2) === z2
+             && !(term[row][e2].ch === " " && e2 > col && term[row][e2+1] && term[row][e2+1].ch === " ")) {
+        s += term[row][e2].ch; e2++;
+      }
+      s = s.replace(/\s+$/, "");
+      if (s) prims.push({t:"text", o:[col*chw, row*chh, z2], s:s,
+                         w:s.length*chw, h:chh, color:c2.fg, bold:c2.bold});
+      col = e2 > col ? e2 : col + 1;
+    }
+  }
+  /* the wave trail: the near-field lift, drawn into the bar field at the
+     depth the rays measured. Same primitives, same path. */
+  var g = CFG.grid;
+  for (var tI = 0; tI < trail.length; tI++) {
+    var tp = trail[tI];
+    var tx = (g[0] + (tp.c+0.5)*g[2]) * chw - 3;
+    var ty = (g[1] + tp.r + 0.5) * chh - 3;
+    var tz = tp.z * CFG.depth[0];
+    prims.push({t:"quad", fill:"rgba(255,80,220," + ((tI+1)/trail.length).toFixed(2) + ")",
+                p:[[tx,ty,tz],[tx+7,ty,tz],[tx+7,ty+7,tz],[tx,ty+7,tz]]});
+  }
+  return prims;
+}
+
+function draw() {
+  var cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+  var chw = CFG.ch[0], chh = CFG.ch[1];
+  var W = CFG.canvas[0]*chw, H = CFG.canvas[1]*chh;
+  if (cv.width !== W+260) { cv.width = W+260; cv.height = H+160; }
+  var OX = 130, OY = 70;
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.clearRect(0,0,cv.width,cv.height);
+  var cx = W/2, cy = H/2, cz = 0;
+  var prims = buildPrims(), drawn = [];
+  for (var i = 0; i < prims.length; i++) {
+    var p = prims[i];
+    if (p.t === "quad") {
+      var q = [rotp(p.p[0],cx,cy,cz), rotp(p.p[1],cx,cy,cz),
+               rotp(p.p[2],cx,cy,cz), rotp(p.p[3],cx,cy,cz)];
+      drawn.push({z:(q[0][2]+q[1][2]+q[2][2]+q[3][2])/4, t:"quad", q:q, fill:p.fill});
+    } else {
+      var o = rotp(p.o,cx,cy,cz);
+      var ex = rotp([p.o[0]+1,p.o[1],p.o[2]],cx,cy,cz);
+      var ey = rotp([p.o[0],p.o[1]+1,p.o[2]],cx,cy,cz);
+      /* A glyph must beat ITS OWN BAR from any side. Sort by the nearer of
+         the bar's two planes at the run's center: seen from the front that
+         is the front face (where the glyph lives), seen from behind it is
+         the back face that would otherwise paint over it. -1 breaks the
+         tie toward the glyph; neighbouring bars still occlude honestly. */
+      var ctrF = rotp([p.o[0]+(p.w||0)/2, p.o[1]+(p.h||0)/2, p.o[2]],cx,cy,cz);
+      var ctrB = rotp([p.o[0]+(p.w||0)/2, p.o[1]+(p.h||0)/2,
+                       p.o[2] > 0 ? MAXZ : 0],cx,cy,cz);
+      drawn.push({z:Math.min(ctrF[2], ctrB[2])-1, t:"text", o:o,
+                  ax:ex[0]-o[0], ay:ex[1]-o[1], bx:ey[0]-o[0], by:ey[1]-o[1],
+                  s:p.s, color:p.color, bold:p.bold});
+    }
+  }
+  drawn.sort(function(a,b){ return b.z - a.z; });
+  for (var d = 0; d < drawn.length; d++) {
+    var e = drawn[d];
+    if (e.t === "quad") {
+      ctx.setTransform(1,0,0,1,OX,OY);
+      ctx.beginPath();
+      ctx.moveTo(e.q[0][0], e.q[0][1]);
+      for (var v = 1; v < 4; v++) ctx.lineTo(e.q[v][0], e.q[v][1]);
+      ctx.closePath(); ctx.fillStyle = e.fill; ctx.fill();
+    } else {
+      ctx.setTransform(e.ax, e.ay, e.bx, e.by, e.o[0]+OX, e.o[1]+OY);
+      ctx.font = (e.bold ? "bold " : "") + (chh-5) + "px Menlo, monospace";
+      ctx.textBaseline = "top";
+      ctx.fillStyle = e.color;
+      ctx.fillText(e.s, 1, 2);
+    }
+  }
+  document.getElementById("diag").textContent =
+    "camera: " + CAMERA.kind + " rot=[" + CAMERA.rot + "] (frozen; never written)\n"
+    + "scene:  rx=" + scenePose.rx.toFixed(3) + " ry=" + scenePose.ry.toFixed(3)
+    + "  drag rotates the assembly; there is no camera control to reach";
+  requestAnimationFrame(draw);
+}
+
+var dragging = false, lx = 0, ly = 0;
+window.addEventListener("mousedown", function(e){ dragging=true; lx=e.clientX; ly=e.clientY; });
+window.addEventListener("mouseup", function(){ dragging=false; });
+window.addEventListener("mousemove", function(e){
+  if (!dragging) return;
+  scenePose.ry += (e.clientX-lx)*0.008; scenePose.rx += (e.clientY-ly)*0.008;
+  lx = e.clientX; ly = e.clientY;
+});
+document.getElementById("flat").onclick = function(){ scenePose.rx = scenePose.ry = 0; };
+
+fetch("scene.cfg").then(function(r){
+  if (!r.ok) throw new Error("scene.cfg: HTTP " + r.status);
+  return r.text();
+}).then(function(text){
+  CFG = parseCfg(text);
+  MAXZ = NO_TARGET * CFG.depth[0];
+  var es = new EventSource("/feed");
+  es.onmessage = function(ev){ onLine(ev.data); };
+  requestAnimationFrame(draw);
+}).catch(function(err){
+  document.getElementById("diag").textContent = "FATAL: " + err.message;
+  throw err;   /* fail loud: no scene, no render, no fallback */
+});
+</script>

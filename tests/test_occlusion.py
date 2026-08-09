@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Occlusion (blocked view) regression tests.
 
-The scene model tracks no_target cells (rays returning nothing due to
-blockage near the lens). When no_target exceeds MAX_NO_TARGET, the frame is
-marked occluded and is not evidence of an empty room. Occluded frames hold
-the state machine in place without emitting occupancy events.
+OCCLUSION MEANS THE ENTIRE SENSOR IS COVERED: a frame is occluded only when
+every cell the scan can answer comes back dead. A frame with ANY answering
+ray is a scene, however close or large the body: half-covered frames are
+what a body passing the sensor produces, and calling those "blocked" is how
+an exit swept past unseen (08-09 13:58). Occluded frames hold the state
+machine in place without emitting occupancy events.
 
   python3 tests/test_occlusion.py
 """
@@ -54,23 +56,21 @@ def drive(eng, t, frames_with_repeats):
 
 
 def make_occluded_frame():
-    """Construct an occluded frame: baseline with >MAX_NO_TARGET cells set to
-    NO_TARGET, leaving a handful of near survivors at 700-800mm."""
-    mat = copy.deepcopy(DEFAULT_BASELINE)
-    # Set more than MAX_NO_TARGET cells to NO_TARGET
-    # Block 33 cells (more than MAX_NO_TARGET=32)
-    no_target_cells = [
-        (0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5), (0, 6), (0, 7),  # row 0: 8 cells
-        (1, 0), (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6),          # row 1: 7 cells
-        (2, 0), (2, 1), (2, 2), (2, 3), (2, 4), (2, 5),                  # row 2: 6 cells
-        (3, 0), (3, 1), (3, 2), (3, 3), (3, 4),                          # row 3: 5 cells
-        (4, 0), (4, 1), (4, 2), (4, 3),                                  # row 4: 4 cells
-        (5, 0), (5, 1), (5, 2),                                          # row 5: 3 cells
-    ]  # total: 33 cells
-    for r, c in no_target_cells:
-        mat[r][c] = NO_TARGET
+    """A truly occluded frame: EVERY cell dead. That is the only thing the
+    word means now; a frame with any survivor is a scene, not an occlusion
+    (see make_halfdead_frame)."""
+    return [[NO_TARGET] * N for _ in range(N)]
 
-    # Add a few near survivors at roughly 700-800mm at unblocked cells
+
+def make_halfdead_frame():
+    """A body hugging the sensor: most rays dead (under minimum range), a
+    few answering. Under the old half-field rule this read "blocked" and
+    froze the crossing exactly when a body was passing the lens on its way
+    out. It must read as a SCENE."""
+    mat = copy.deepcopy(DEFAULT_BASELINE)
+    for r in range(6):
+        for c in range(8):
+            mat[r][c] = NO_TARGET
     mat[6][5] = 750
     mat[6][6] = 780
     mat[7][5] = 720
@@ -129,11 +129,13 @@ def main():
     occluded_frame = make_occluded_frame()
     reading = read_frame(occluded_frame, DEFAULT_BASELINE)
     check(reading.occluded,
-          "scenario 1: read_frame on occluded frame reports .occluded True")
+          "scenario 1: a fully dead frame reports .occluded True")
     check(reading.no_target_count > SceneParams.MAX_NO_TARGET,
-          "scenario 1: read_frame on occluded frame reports .no_target_count > MAX_NO_TARGET")
-    check(len(reading.near_returns) > 0,
-          "scenario 1: read_frame on occluded frame has non-empty .near_returns")
+          "scenario 1: .no_target_count exceeds MAX_NO_TARGET (all 64 dead)")
+    reading = read_frame(make_halfdead_frame(), DEFAULT_BASELINE)
+    check(not reading.occluded,
+          "scenario 1b: a body hugging the sensor (most rays dead, a few "
+          "answering) is a SCENE, not an occlusion")
 
     # Scenario 2: read_frame on normal empty frame
     # Empty frame reports .occluded False.
