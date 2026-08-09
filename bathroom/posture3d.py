@@ -105,10 +105,10 @@ UPRIGHT_CELLS = 24
 # further out than this is a body in front of the lens, and falls through to
 # the upright branches, where LENS_MM already reads it as WALKING.
 SIT_MAX_FRONT_MM = 450
-BLOCKED_FRACTION = 0.5  # more than half the rays THE SCAN ANSWERS coming back
-                        # dead is not a body, it is something over the sensor.
-                        # The largest attested body leaves 12 rays dead; a
-                        # blocked view leaves 24 and up.
+BLOCKED_FRACTION = 1.0  # EVERY ray the scan answers coming back dead is a
+                        # covered sensor. Anything less is a scene: a body
+                        # leaves dead rays too, and which is which is not
+                        # this module's call.
 
 # the toilet's own columns, from the zone geometry rather than typed in
 TOILET_COLS = frozenset(c for (_r, c) in ZONE_CELLS[Zone.TOTO])
@@ -221,7 +221,7 @@ def features(matrix, baseline, floor=None):
                and baseline[r][c] < NO_TARGET)
     return {
         "present": present_cells(matrix, baseline, floor),
-        "blocked": bool(answerable) and dead > BLOCKED_FRACTION * answerable,
+        "blocked": bool(answerable) and dead >= BLOCKED_FRACTION * answerable,
         "dead_rays": dead,
         "seat_mm": seat_mm(baseline),
         "seat_advance": seat_advance(matrix, baseline),
