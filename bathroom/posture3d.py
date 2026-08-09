@@ -35,7 +35,15 @@ import statistics
 
 from .zones import N, NO_TARGET, DOOR_COL, State, ZONE_CELLS, Zone
 
-NEAR_MM = 250       # nearer than the empty room by this much: mass in the way
+NEAR_MM = 350       # nearer than the empty room by this much: mass in the way.
+                    # Raised from 250 after the sensor was bumped and the empty
+                    # room started reading a handful of cells 250-330mm nearer
+                    # than the pre-bump baseline. Those cells passed the flat
+                    # 250 cut, joined a shape big enough to be a body, and let
+                    # the seat_advance branch briefly commit SITTING against no
+                    # one. 350 puts the noise floor above what a settled sensor
+                    # deviation reads, without touching what a real body reads
+                    # (torso returns are hundreds of mm nearer than baseline).
 BODY_MIN = 5        # a connected shape smaller than this is not a body
 LENS_MM = 680       # an upright shape this near is crossing in front of the
                     # lens, not standing at the toilet. Attested: walking reads
