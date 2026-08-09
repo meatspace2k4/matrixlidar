@@ -26,6 +26,12 @@ Decisions:
   its own play. There is no clock anywhere: the once-a-day 05:00 reset
   this replaces is gone, not disabled.
 
+A hand WAVED NEAR THE SENSOR stops playback (wave4d: the trajectory of the
+near-field cluster in metric 3D over time; normal movement, standing up and
+walking never enter the near-field, and a passing body translates instead of
+oscillating). It ends playback the same way walking away does: the 2s fade.
+Additive beside the walk-away fade, which is untouched.
+
 IR is recorded, never obeyed. The daemon opens the Pi's local receiver
 (bathroom/ir.py; absent hardware is logged once and costs nothing) and every
 frame FINGERPRINT is printed and MARKed into the session archive on the
@@ -56,7 +62,7 @@ import time
 
 from collections import deque
 
-from . import archive, classify, config, detect, ir as ir_mod, occupancy, player as player_mod, posture3d, scene as scene_mod, stream, threshold
+from . import archive, classify, config, detect, ir as ir_mod, occupancy, player as player_mod, posture3d, scene as scene_mod, stream, threshold, wave4d
 from .donewith import DoneWith, FADE
 from .engine import StateEngine
 from .live import DRIFT_FRAMES, _direction
@@ -389,6 +395,7 @@ def main():
                  "will cut instead of fading. Point the unit's ExecStart at "
                  "~/washlet/venv/bin/python." % sys.executable)
     done = DoneWith()
+    waver = wave4d.WaveTracker()
 
     # Say it out loud at every start: the latch came up CLEAR. A restart is
     # a rearm, and after it the next sit plays.
@@ -470,6 +477,12 @@ def main():
                 _log("player ended rc=%d" % rc)
 
             marker.update(u, ru, t)
+            if waver.update(m, t) == wave4d.WAVE:
+                _log("WAVE  near-field wave, 2s out")
+                player.stop()
+                if fader is not None:
+                    # same exit as walking away: the 2s fade, not a cut
+                    fader.fade(seconds=2.0)
             if done.update(u.committed) == FADE:
                 _log("FADE done with the toilet, 2s out")
                 if fader is not None:
