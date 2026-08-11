@@ -26,11 +26,23 @@ Decisions:
   its own play. There is no clock anywhere: the once-a-day 05:00 reset
   this replaces is gone, not disabled.
 
-A hand WAVED NEAR THE SENSOR stops playback (wave4d: the trajectory of the
-near-field cluster in metric 3D over time; normal movement, standing up and
-walking never enter the near-field, and a passing body translates instead of
-oscillating). It ends playback the same way walking away does: the 2s fade.
-Additive beside the walk-away fade, which is untouched.
+HOW LONG THE TRACK PLAYS (bathroom/playwindow.py)
+
+- by default it fades out after --auto-fade seconds (25) of playback: most
+  visits want a few seconds of music, not the whole song
+- a hand WAVED NEAR THE SENSOR during playback HOLDS it open: the timer is
+  cancelled and the track plays on indefinitely
+- the NEXT wave fades it out. That is the only stop the wave has now
+- either way the fade is 2s, the same ending the walk-away fade gives, and
+  the latch stays spent until the next entry
+
+The wave itself is unchanged (wave4d: the trajectory of the near-field
+cluster in metric 3D over time; normal movement, standing up and walking
+never enter the near-field, and a passing body translates instead of
+oscillating). Only what this daemon does with a WAVE moved: a gesture is
+the right control for the rare case (keep going), a timer for the common
+one (stop on its own). The walk-away fade is untouched and still ends
+playback whatever the window is doing.
 
 IR is recorded, never obeyed. The daemon opens the Pi's local receiver
 (bathroom/ir.py; absent hardware is logged once and costs nothing) and every
@@ -62,7 +74,7 @@ import time
 
 from collections import deque
 
-from . import archive, classify, config, detect, ir as ir_mod, occupancy, player as player_mod, posture3d, scene as scene_mod, stream, threshold, wave4d
+from . import archive, classify, config, detect, ir as ir_mod, occupancy, player as player_mod, playwindow, posture3d, scene as scene_mod, stream, threshold, wave4d
 from .donewith import DoneWith, FADE
 from .engine import StateEngine
 from .live import DRIFT_FRAMES, _direction
@@ -327,6 +339,10 @@ def main():
                     "clears on the next entry)")
     ap.add_argument("--hold", type=float, default=SIT_HOLD_S,
                     help="seconds committed SITTING must hold before firing")
+    ap.add_argument("--auto-fade", type=float, default=playwindow.AUTO_FADE_S,
+                    metavar="SECONDS",
+                    help="playback fades out after this long unless a wave "
+                         "holds it open (default %.0f)" % playwindow.AUTO_FADE_S)
     ap.add_argument("--volume", type=int, default=VOLUME,
                     help="HomePod volume %% applied shortly into each play")
     ap.add_argument("--homepod", default=DEF_HOMEPOD, help="HomePod IP")
@@ -396,6 +412,7 @@ def main():
                  "~/washlet/venv/bin/python." % sys.executable)
     done = DoneWith()
     waver = wave4d.WaveTracker()
+    window = playwindow.PlayWindow(auto_fade_s=args.auto_fade)
 
     # Say it out loud at every start: the latch came up CLEAR. A restart is
     # a rearm, and after it the next sit plays.
@@ -477,14 +494,26 @@ def main():
                 _log("player ended rc=%d" % rc)
 
             marker.update(u, ru, t)
-            if waver.update(m, t) == wave4d.WAVE:
-                _log("WAVE  near-field wave, 2s out")
-                player.stop()
+            # A wave HOLDS the track open; the second wave ends it. Playback
+            # otherwise fades on its own after --auto-fade seconds. The wave
+            # detector is unchanged; only what this daemon does with a WAVE
+            # lives here (see bathroom/playwindow.py).
+            waved = waver.update(m, t) == wave4d.WAVE
+            act = window.update(t, waved)
+            if act == playwindow.HOLD:
+                _log("HOLD  wave during playback: auto-fade off, playing on")
+            elif act == playwindow.FADE_OUT:
+                _log("WAVE  second wave, %.0fs out" % playwindow.FADE_S
+                     if waved else
+                     "AUTO  %.0fs of playback, %.0fs out"
+                     % (args.auto_fade, playwindow.FADE_S))
                 if fader is not None:
-                    # same exit as walking away: the 2s fade, not a cut
-                    fader.fade(seconds=2.0)
+                    fader.fade(seconds=playwindow.FADE_S)
+                else:
+                    player.stop()
             if done.update(u.committed) == FADE:
                 _log("FADE done with the toilet, 2s out")
+                window.ended()
                 if fader is not None:
                     fader.fade(seconds=2.0)
                 else:
@@ -502,6 +531,7 @@ def main():
                 _log("PLAY  sit held %.1fs -> main track from the top at %d%%%s"
                      % (args.hold, args.volume, dry))
                 player.stop()
+                window.start(t)
                 if fader is not None:
                     # one pyatv session, volume set before the first sample, and
                     # the same object fades it when the toilet is done with
@@ -516,6 +546,7 @@ def main():
                 _log("STOP  the played visit ended%s; latch holds until the "
                      "next entry"
                      % (", stopping player" if player.running() else ""))
+                window.ended()
                 player.stop()
                 if fader is not None:
                     fader.stop()
