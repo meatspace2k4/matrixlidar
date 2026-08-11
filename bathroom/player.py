@@ -174,6 +174,33 @@ class Playback:
             sys.stderr.write("fade: ramp failed (%s); cutting\n" % e)
         self.stop(timeout)
 
+    def set_volume(self, volume, timeout=5.0):
+        """Change the volume of the session that is already playing.
+
+        Waits for the connection the same way `fade` does, and for the same
+        reason: a call arriving before the scan and connect finish would find
+        `_atv` unset. Returns True if the receiver took it.
+
+        `_volume` is updated too, so a later fade ramps down from the level
+        the track is ACTUALLY at rather than the one it started at.
+        """
+        deadline = time.time() + CONNECT_WAIT_S
+        while self._atv is None and self.is_playing() and time.time() < deadline:
+            time.sleep(0.05)
+        self._volume = volume
+        if self._atv is None:
+            sys.stderr.write("set_volume: no session after %.1fs\n"
+                             % CONNECT_WAIT_S)
+            return False
+        fut = asyncio.run_coroutine_threadsafe(
+            self._atv.audio.set_volume(float(volume)), self._loop)
+        try:
+            fut.result(timeout=timeout)
+            return True
+        except Exception as e:
+            sys.stderr.write("set_volume: %s\n" % e)
+            return False
+
     def stop(self, timeout=5.0):
         if self._loop and self._task and not self._task.done():
             self._loop.call_soon_threadsafe(self._task.cancel)

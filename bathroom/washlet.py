@@ -12,10 +12,12 @@ Decisions:
 - QUEUE: the room becomes OCCUPIED with the latch clear (including a body
   already present at daemon start) -> stream the entry sound at --volume
   if one is configured, otherwise no audio (the machinery still runs).
-- PLAY: committed SITTING_AT_TOILET holds --hold seconds -> kill whatever
-  is streaming and start the MAIN track from the top at --volume. Happens
-  once per VISIT: the latch blocks replays on continued sitting,
-  stand-up/sit-down cycles, and the track ending; the next entry clears it.
+- PLAY: the committed posture goes STANDING_AT_TOILET -> SITTING_AT_TOILET,
+  the act of sitting down -> kill whatever is streaming and start the MAIN
+  track from the top at --volume. Happens once per VISIT: the latch blocks
+  replays on continued sitting, stand-up/sit-down cycles, and the track
+  ending; the next entry clears it. There is no dwell and no delay: the
+  music starts as the body lands.
 - UNQUEUE: occupancy ends with no sit (entry aborted, stream gap, or exit)
   -> stop the entry sound.
 - STOP (vacancy): room EMPTY while posture also reads EMPTY -> stop
@@ -31,8 +33,11 @@ HOW LONG THE TRACK PLAYS (bathroom/playwindow.py)
 - by default it fades out after --auto-fade seconds (25) of playback: most
   visits want a few seconds of music, not the whole song
 - a hand WAVED NEAR THE SENSOR during playback HOLDS it open: the timer is
-  cancelled and the track plays on indefinitely
-- the NEXT wave fades it out. That is the only stop the wave has now
+  cancelled, the track plays on indefinitely, and the volume goes up to
+  --hold-volume (20%). Holding it open is a request for the music, so it
+  gets louder; the default stays quiet because most plays are background
+- the NEXT wave fades it out, from whatever level it is at. That is the
+  only stop the wave has now
 - either way the fade is 2s, the same ending the walk-away fade gives, and
   the latch stays spent until the next entry
 
@@ -81,21 +86,10 @@ from .live import DRIFT_FRAMES, _direction
 from .occupancy import RoomState
 from .zones import State
 
-SIT_HOLD_S = 2.0    # SITTING must be OBSERVED for this long before the track
-                    # fires. This is the debounce, not a delay: a false sit that
-                    # lasts under 2s never reaches the audio and never spends the
-                    # one-shot latch. A false SITTING inside a stand ran 1.1s and
-                    # burned the latch 45 seconds before the real sit; at
-                    # hold=0.0 the first committed frame fires, so a single
-                    # misread costs the whole visit. Dwell only accumulates on
-                    # frames actually observed as SITTING (see _sit_time), so a
-                    # seated body that jitters through STANDING keeps its clock
-                    # rather than restarting it.
-                    #
-                    # was 0.0: fire the moment the posture commits to
-                    # SITTING. The engine's commit_after already requires
-                    # several consecutive frames, so this is not one noisy frame.
 VOLUME = 10         # HomePod volume % applied as soon as the session accepts it
+HOLD_VOLUME = 20    # ... and what a HOLD raises it to. Holding the track open
+                    # is a request for the music, so it gets louder; the
+                    # default stays quiet because most plays are background.
 POKE_TRIES = 8      # set_volume attempts against the young stream session
 POKE_INTERVAL_S = 1.5
 STOP_GRACE_S = 3.0  # SIGTERM -> SIGKILL grace for the player child
@@ -138,59 +132,45 @@ class SitLatch:
 
     update() consumes (committed posture, room state, t) once per frame and
     returns QUEUE (occupancy began: latch cleared for the new visit, entry
-    sound), PLAY (sit held: the main track, once for this visit), UNQUEUE
-    (occupancy evaporated with no sit), STOP (vacancy: cut the audio, latch
-    untouched), or None. REARM is folded into the entry edge: a new body in
-    the room is what rearms, never a clock and never the empty room itself.
+    sound), PLAY (the act of sitting down: the main track, once for this
+    visit), UNQUEUE (occupancy evaporated with no sit), STOP (vacancy: cut
+    the audio, latch untouched), or None. REARM is folded into the entry
+    edge: a new body in the room is what rearms, never a clock and never the
+    empty room itself.
+
+    PLAY IS A TRANSITION, NOT A DWELL. It fires on the committed posture
+    going STANDING_AT_TOILET -> SITTING_AT_TOILET: the act of sitting down,
+    which is the thing the track is for. The 2s sit dwell it replaces was a
+    debounce standing in for exactly this. It cost two seconds of music on
+    every real sit and still admitted any sitting-shaped reading that
+    persisted, which is what a stand misreading as a sit does.
+
+    Coming from STANDING is what makes it a sit rather than a shape. Both
+    states are already debounced by the engine's commit_after, so this is a
+    transition between two committed states, not two noisy frames.
     """
 
-    __slots__ = ("hold", "latched", "_sit_time", "_prev_room",
-                 "_last_t", "_played")
+    __slots__ = ("latched", "_prev_room", "_last_posture", "_played")
 
-    def __init__(self, hold=SIT_HOLD_S):
-        self.hold = hold
+    def __init__(self):
         self.latched = False
-        self._sit_time = 0.0     # seconds actually OBSERVED as committed SITTING
         self._prev_room = None
-        self._last_t = None
-        self._played = False     # THIS visit started the main track, so THIS
-                                 # visit's exit has audio to stop
+        self._last_posture = None  # last KNOWN committed posture (see below)
+        self._played = False       # THIS visit started the main track, so THIS
+                                   # visit's exit has audio to stop
 
     def update(self, committed, room, t):
         prev, self._prev_room = self._prev_room, room
 
-        # The dwell counts seconds OBSERVED as sitting. UNKNOWN NEVER touches
-        # it: UNKNOWN means "cannot tell", not "the body left", and treating a
-        # gap as evidence of absence is what lost real sits. On 07-25 someone
-        # sat for six minutes reading SITTING 1.5s, UNKNOWN, SITTING 1.6s,
-        # UNKNOWN, and a dwell that restarted on every gap never reached 2.0s.
-        #
-        # There is no cap on how long a gap may last. A dwell that survives a
-        # long gap costs nothing: the track is one-shot per visit, so the
-        # worst case is one play into a session that already has an occupant,
-        # and the next entry rearms anyway. Losing a real sit costs the whole
-        # visit's play.
-        dt = 0.0 if self._last_t is None else max(0.0, t - self._last_t)
-        self._last_t = t
-        if committed == State.SITTING_AT_TOILET:
-            self._sit_time += dt
-        elif committed != State.UNKNOWN:
-            # DRAIN, do not reset. A single non-sitting frame used to zero the
-            # clock, so a seated body that flickers to STANDING every ninth
-            # frame never reached the dwell and the track never played. Draining
-            # at the same rate it fills means a real sit nets positive through
-            # jitter, and a stand that misreads as sitting one frame in three
-            # nets negative and never fires.
-            #
-            #   1.1s false sit inside a stand                nothing
-            #   a real sit, held                             PLAY at 3.4s
-            #   a real sit jittering 1 frame in 9            PLAY at 3.6s
-            #   a real sit jittering 1 frame in 3            PLAY at 7.0s
-            #   a stand misreading as sitting 1 frame in 3   nothing
-            self._sit_time = max(0.0, self._sit_time - dt)
-        # leaving the room is the only thing that wipes the slate
-        if room != RoomState.OCCUPIED:
-            self._sit_time = 0.0
+        # The transition is tracked across UNKNOWN, not through it. UNKNOWN
+        # means "cannot tell", never "the body moved", and a stand-to-sit is
+        # routinely split by one: the body is mid-motion exactly when the
+        # classifier is least sure. Remembering the last KNOWN posture makes
+        # STANDING -> UNKNOWN -> SITTING the same event as STANDING ->
+        # SITTING, which is what it physically is.
+        was = self._last_posture
+        if committed != State.UNKNOWN:
+            self._last_posture = committed
 
         # THE NEXT ENTRY IS WHAT REARMS: an OCCUPIED edge coming FROM EMPTY.
         # From-EMPTY is what makes it a new visit. A gap does not qualify:
@@ -220,11 +200,12 @@ class SitLatch:
             return STOP
 
         if not self.latched:
-            # committed SITTING is required, not just a satisfied dwell: with
-            # hold=0 the dwell test alone is true on the first frame of any
-            # posture, which fired the track at someone walking past.
+            # the act of sitting down: STANDING at the toilet, then SITTING on
+            # it. A body that is merely sitting-SHAPED never fires this,
+            # because it never came from standing at the fixture, and someone
+            # walking past never does either.
             if (committed == State.SITTING_AT_TOILET
-                    and self._sit_time >= self.hold):
+                    and was == State.STANDING_AT_TOILET):
                 self.latched = True
                 self._played = True
                 return PLAY
@@ -337,12 +318,13 @@ def main():
     ap = argparse.ArgumentParser(
         description="Sit-triggered AirPlay daemon (one play per visit, latch "
                     "clears on the next entry)")
-    ap.add_argument("--hold", type=float, default=SIT_HOLD_S,
-                    help="seconds committed SITTING must hold before firing")
     ap.add_argument("--auto-fade", type=float, default=playwindow.AUTO_FADE_S,
                     metavar="SECONDS",
                     help="playback fades out after this long unless a wave "
                          "holds it open (default %.0f)" % playwindow.AUTO_FADE_S)
+    ap.add_argument("--hold-volume", type=int, default=HOLD_VOLUME,
+                    help="volume %% the first wave raises playback to "
+                         "(default: %(default)s)")
     ap.add_argument("--volume", type=int, default=VOLUME,
                     help="HomePod volume %% applied shortly into each play")
     ap.add_argument("--homepod", default=DEF_HOMEPOD, help="HomePod IP")
@@ -382,7 +364,7 @@ def main():
     # alone stick OCCUPIED when someone leaves with the door already open.
     sc = scene_mod.Scene(baseline)
     crossing = threshold.Crossing()
-    latch = SitLatch(hold=args.hold)
+    latch = SitLatch()
     player = Player(args.atvremote, args.homepod, args.volume,
                     dry_run=args.dry_run)
     # one pyatv session: volume set before the stream, and a fade that can
@@ -416,10 +398,10 @@ def main():
 
     # Say it out loud at every start: the latch came up CLEAR. A restart is
     # a rearm, and after it the next sit plays.
-    _log("washlet daemon up: posture=%s hold=%.1fs vol=%d homepod=%s media=%s "
-         "queue=%s%s | latch REARMED by this start; one play per visit, "
-         "cleared by the next entry"
-         % (args.posture, args.hold, args.volume, args.homepod, args.media,
+    _log("washlet daemon up: posture=%s vol=%d homepod=%s media=%s "
+         "queue=%s%s | latch REARMED by this start; one play per visit on "
+         "standing->sitting, cleared by the next entry"
+         % (args.posture, args.volume, args.homepod, args.media,
             args.queue_media or "(disabled)",
             " (DRY RUN)" if args.dry_run else ""))
     t0 = None
@@ -466,7 +448,7 @@ def main():
                 stream.send("STATE " + json.dumps(
                     {"posture": u.committed.name, "room": str(ru.room),
                      "occupants": ru.occupants, "t": round(t, 2),
-                     "event": ru.event, "sit_s": round(latch._sit_time, 2),
+                     "event": ru.event,
                      "since": round(ru.since, 2), "blocked": ru.blocked,
                      "door": None if door.pct is None else round(door.pct),
                      "occ": u.features["occ_count"],
@@ -501,7 +483,16 @@ def main():
             waved = waver.update(m, t) == wave4d.WAVE
             act = window.update(t, waved)
             if act == playwindow.HOLD:
-                _log("HOLD  wave during playback: auto-fade off, playing on")
+                _log("HOLD  wave during playback: auto-fade off, playing on "
+                     "at %d%%%s" % (args.hold_volume,
+                                    " (dry run, no audio)" if args.dry_run
+                                    else ""))
+                if fader is not None:
+                    fader.set_volume(args.hold_volume)
+                else:
+                    # the atvremote path pokes its own volume attribute
+                    player.volume = args.hold_volume
+                    player.unmute()
             elif act == playwindow.FADE_OUT:
                 _log("WAVE  second wave, %.0fs out" % playwindow.FADE_S
                      if waved else
@@ -528,8 +519,8 @@ def main():
                 else:
                     _log("QUEUE body in room (entry sound disabled)")
             elif action == PLAY:
-                _log("PLAY  sit held %.1fs -> main track from the top at %d%%%s"
-                     % (args.hold, args.volume, dry))
+                _log("PLAY  sat down (standing->sitting) -> main track from "
+                     "the top at %d%%%s" % (args.volume, dry))
                 player.stop()
                 window.start(t)
                 if fader is not None:
