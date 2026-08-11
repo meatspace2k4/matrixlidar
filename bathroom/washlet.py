@@ -95,7 +95,7 @@ SIT_HOLD_S = 2.0    # SITTING must be OBSERVED for this long before the track
                     # was 0.0: fire the moment the posture commits to
                     # SITTING. The engine's commit_after already requires
                     # several consecutive frames, so this is not one noisy frame.
-VOLUME = 20         # HomePod volume % applied as soon as the session accepts it
+VOLUME = 10         # HomePod volume % applied as soon as the session accepts it
 POKE_TRIES = 8      # set_volume attempts against the young stream session
 POKE_INTERVAL_S = 1.5
 STOP_GRACE_S = 3.0  # SIGTERM -> SIGKILL grace for the player child
