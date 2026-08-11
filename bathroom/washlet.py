@@ -33,9 +33,10 @@ HOW LONG THE TRACK PLAYS (bathroom/playwindow.py)
 - by default it fades out after --auto-fade seconds (25) of playback: most
   visits want a few seconds of music, not the whole song
 - a hand WAVED NEAR THE SENSOR during playback HOLDS it open: the timer is
-  cancelled, the track plays on indefinitely, and the volume goes up to
-  --hold-volume (20%). Holding it open is a request for the music, so it
-  gets louder; the default stays quiet because most plays are background
+  cancelled, the track plays on indefinitely, and the volume RAMPS up to
+  --hold-volume (20%) over half a second. Holding it open is a request for
+  the music, so it gets louder; the default stays quiet because most plays
+  are background
 - the NEXT wave fades it out, from whatever level it is at. That is the
   only stop the wave has now
 - either way the fade is 2s, the same ending the walk-away fade gives, and
@@ -87,9 +88,13 @@ from .occupancy import RoomState
 from .zones import State
 
 VOLUME = 10         # HomePod volume % applied as soon as the session accepts it
-HOLD_VOLUME = 20    # ... and what a HOLD raises it to. Holding the track open
-                    # is a request for the music, so it gets louder; the
-                    # default stays quiet because most plays are background.
+HOLD_VOLUME = 20    # ... and what a HOLD raises it to, over HOLD_RAMP_S.
+                    # Holding the track open is a request for the music, so it
+                    # gets louder; the default stays quiet because most plays
+                    # are background.
+HOLD_RAMP_S = 0.5   # the lift is a ramp, not a jump: a step change on a quiet
+                    # track in a small tiled room is startling, and every other
+                    # volume move here is a ramp already.
 POKE_TRIES = 8      # set_volume attempts against the young stream session
 POKE_INTERVAL_S = 1.5
 STOP_GRACE_S = 3.0  # SIGTERM -> SIGKILL grace for the player child
@@ -488,7 +493,7 @@ def main():
                                     " (dry run, no audio)" if args.dry_run
                                     else ""))
                 if fader is not None:
-                    fader.set_volume(args.hold_volume)
+                    fader.set_volume(args.hold_volume, seconds=HOLD_RAMP_S)
                 else:
                     # the atvremote path pokes its own volume attribute
                     player.volume = args.hold_volume

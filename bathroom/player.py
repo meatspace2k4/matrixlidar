@@ -69,11 +69,18 @@ async def _connect(address, loop, timeout):
     return await pyatv.connect(conf, loop)
 
 
+async def ramp_volume(atv, frm, to, seconds, steps=20):
+    """Walk the volume from `frm` to `to` over `seconds`, inclusive of both
+    ends. One implementation for every volume move, so a fade down and a
+    lift up cannot drift apart."""
+    for i in range(steps + 1):
+        await atv.audio.set_volume(frm + (to - frm) * i / steps)
+        await asyncio.sleep(seconds / steps)
+
+
 async def fade_out(atv, from_volume, seconds=2.0, steps=20):
     """Ramp the volume to zero over `seconds`, then stop."""
-    for i in range(steps, -1, -1):
-        await atv.audio.set_volume(from_volume * i / steps)
-        await asyncio.sleep(seconds / steps)
+    await ramp_volume(atv, from_volume, 0, seconds, steps)
 
 
 async def play(path, address, volume=20, timeout=5, on_start=None,
@@ -174,32 +181,38 @@ class Playback:
             sys.stderr.write("fade: ramp failed (%s); cutting\n" % e)
         self.stop(timeout)
 
-    def set_volume(self, volume, timeout=5.0):
-        """Change the volume of the session that is already playing.
+    def set_volume(self, volume, seconds=0.5):
+        """Ramp the playing session to `volume` over `seconds`.
 
-        Waits for the connection the same way `fade` does, and for the same
-        reason: a call arriving before the scan and connect finish would find
-        `_atv` unset. Returns True if the receiver took it.
+        A ramp, not a jump: a step change on a quiet track in a small tiled
+        room is startling, and the rest of this daemon's volume moves are
+        ramps already.
 
-        `_volume` is updated too, so a later fade ramps down from the level
-        the track is ACTUALLY at rather than the one it started at.
+        Does NOT wait for the ramp: the caller is the frame loop, and
+        blocking it for half a second drops sensor frames. The coroutine runs
+        on the playback thread's loop and reports its own failure. `_volume`
+        is updated up front, so a fade arriving mid-ramp still ramps down
+        from the level being aimed at rather than the one left behind.
+
+        False means there was no session to ramp (playback already over, or
+        the connect has not landed yet); the volume is remembered either way,
+        so the next play starts where it was asked to.
         """
-        deadline = time.time() + CONNECT_WAIT_S
-        while self._atv is None and self.is_playing() and time.time() < deadline:
-            time.sleep(0.05)
-        self._volume = volume
-        if self._atv is None:
-            sys.stderr.write("set_volume: no session after %.1fs\n"
-                             % CONNECT_WAIT_S)
+        frm, self._volume = self._volume, volume
+        atv, loop = self._atv, self._loop
+        if atv is None or loop is None:
+            sys.stderr.write("set_volume: no live session\n")
             return False
         fut = asyncio.run_coroutine_threadsafe(
-            self._atv.audio.set_volume(float(volume)), self._loop)
-        try:
-            fut.result(timeout=timeout)
-            return True
-        except Exception as e:
-            sys.stderr.write("set_volume: %s\n" % e)
-            return False
+            ramp_volume(atv, frm, volume, seconds), loop)
+
+        def _report(f):
+            exc = f.exception()
+            if exc is not None:
+                sys.stderr.write("set_volume: ramp failed (%s)\n" % exc)
+
+        fut.add_done_callback(_report)
+        return True
 
     def stop(self, timeout=5.0):
         if self._loop and self._task and not self._task.done():
