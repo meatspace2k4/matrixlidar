@@ -517,11 +517,18 @@ def main():
             action = latch.update(u.committed, ru.room, t)
             dry = " (dry run, no audio)" if args.dry_run else ""
             if action == QUEUE:
+                # WARM THE AIRPLAY SESSION WHILE THEY WALK IN. Scanning and
+                # connecting cost 0.46s against this HomePod, and they used
+                # to be spent after the body had already sat down. Nothing
+                # about them needs the music. Returns immediately; the sit
+                # then only has to start the stream.
+                if fader is not None and fader.warm(args.homepod):
+                    _log("QUEUE body in room, warming the session%s" % dry)
                 if args.queue_media:
                     _log("QUEUE body in room -> entry sound at %d%%%s"
                          % (args.volume, dry))
                     player.start(args.queue_media)
-                else:
+                elif fader is None:
                     _log("QUEUE body in room (entry sound disabled)")
             elif action == PLAY:
                 _log("PLAY  sat down (standing->sitting) -> main track from "
@@ -530,8 +537,13 @@ def main():
                 window.start(t)
                 if fader is not None:
                     # one pyatv session, volume set before the first sample, and
-                    # the same object fades it when the toilet is done with
-                    fader.start(args.media, args.homepod, volume=args.volume)
+                    # the same object fades it when the toilet is done with.
+                    # "warm" means the entry already paid for scan+connect.
+                    how = fader.start(args.media, args.homepod,
+                                      volume=args.volume)
+                    if how == "cold":
+                        _log("      (cold session: connecting now, "
+                             "the entry warm-up did not land)")
                 else:
                     player.start(args.media)
             elif action == UNQUEUE:

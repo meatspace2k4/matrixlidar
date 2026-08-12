@@ -117,7 +117,8 @@ class Playback:
     cancels it.
     """
 
-    __slots__ = ("_thread", "_loop", "_task", "_done", "_atv", "_volume")
+    __slots__ = ("_thread", "_loop", "_task", "_done", "_atv", "_volume",
+                 "_warm_addr", "_parked")
 
     def __init__(self):
         self._thread = None
@@ -126,33 +127,143 @@ class Playback:
         self._done = None
         self._atv = None
         self._volume = 20
+        self._warm_addr = None   # address the held-open session is against
+        self._parked = False     # the loop is in run_forever (warm), not
+                                 # run_until_complete (cold): they end
+                                 # differently, so stop() must know which
+
+    # --- the warm session -------------------------------------------------
+    #
+    # Scanning and connecting cost 0.46s against this HomePod (0.09 scan,
+    # 0.37 connect, measured on the Pi), and they used to be spent AFTER the
+    # body had already sat down. Nothing about them needs the music: they can
+    # be spent while the person is still walking in, so the sit only has to
+    # start the stream.
+
+    def warm(self, address, timeout=5):
+        """Open the session ahead of the music. Returns immediately.
+
+        Idempotent for the same address, and a no-op while something is
+        playing (the session in use is already warm). Failure is reported and
+        left alone: the next `start` simply connects the old way, which is
+        the same work in the same place it always happened.
+        """
+        if self.is_playing():
+            return False
+        if self._atv is not None and self._warm_addr == address:
+            return True
+        self.stop()
+        self._spawn_loop()
+        loop = self._loop
+
+        def _took(f):
+            try:
+                self._atv = f.result()
+                self._warm_addr = address
+            except Exception as e:
+                sys.stderr.write("warm: %s\n" % e)
+
+        asyncio.run_coroutine_threadsafe(
+            _connect(address, loop, timeout), loop).add_done_callback(_took)
+        return True
+
+    def is_warm(self, address=None):
+        return (self._atv is not None
+                and (address is None or self._warm_addr == address))
+
+    def _spawn_loop(self):
+        """A thread with a PARKED event loop, and nothing on it yet."""
+        import threading
+        ready = threading.Event()
+
+        def run():
+            # the loop is held in a LOCAL: stop() clears self._loop, and this
+            # thread must still be able to close the one it owns
+            loop = asyncio.new_event_loop()
+            self._loop = loop
+            self._parked = True
+            asyncio.set_event_loop(loop)
+            ready.set()
+            loop.run_forever()
+            loop.close()
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+        ready.wait(2.0)
 
     def start(self, path, address, volume=20, on_start=None):
         import threading
+
+        # WARM PATH: the session is already open, so this is only the stream.
+        if self._atv is not None and self._warm_addr == address and self._loop:
+            self._volume = volume
+            self._done = threading.Event()
+            atv = self._atv
+
+            async def stream_warm():
+                try:
+                    await atv.audio.set_volume(float(volume))
+                    if on_start:
+                        on_start()
+                    await atv.stream.stream_file(path)
+                finally:
+                    try:
+                        atv.close()
+                    except Exception:
+                        pass
+                    self._atv = None
+                    self._warm_addr = None
+                    self._done.set()
+
+            self._task = asyncio.run_coroutine_threadsafe(stream_warm(),
+                                                          self._loop)
+            return "warm"
+
+        # COLD PATH: scan, connect, then stream, exactly as before.
         self.stop()
         self._done = threading.Event()
 
         def run():
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
+            loop = asyncio.new_event_loop()   # local: see _spawn_loop
+            self._loop = loop
+            self._parked = False
+            asyncio.set_event_loop(loop)
             self._volume = volume
-            self._task = self._loop.create_task(
+            self._task = loop.create_task(
                 play(path, address, volume=volume, on_start=on_start,
                      on_connect=self._took_connection))
             try:
-                self._loop.run_until_complete(self._task)
+                loop.run_until_complete(self._task)
             except (asyncio.CancelledError, PlayError, Exception):
                 pass
             finally:
                 self._atv = None
-                self._loop.close()
+                self._warm_addr = None
+                loop.close()
                 self._done.set()
 
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
+        return "cold"
 
     def _took_connection(self, atv):
         self._atv = atv
+
+    def _cancel_task(self):
+        """Cancel whatever start() left behind: an asyncio.Task on the cold
+        path, a concurrent Future from run_coroutine_threadsafe on the warm
+        one. Both cancel the same coroutine; only the call differs."""
+        task, self._task = self._task, None
+        if task is None:
+            return
+        try:
+            if isinstance(task, asyncio.Task):
+                if not task.done() and self._loop:
+                    self._loop.call_soon_threadsafe(task.cancel)
+            else:
+                task.cancel()
+        except Exception:
+            pass
 
     def is_playing(self):
         return bool(self._done) and not self._done.is_set()
@@ -215,11 +326,36 @@ class Playback:
         return True
 
     def stop(self, timeout=5.0):
-        if self._loop and self._task and not self._task.done():
-            self._loop.call_soon_threadsafe(self._task.cancel)
+        """Cancel the stream, drop the session, and tear the thread down.
+
+        A warm session is torn down too: stop means stop, and a connection
+        held open past the end of a visit is one the receiver may have closed
+        under us anyway. The next warm re-opens it.
+
+        The cancelled coroutine is given a moment to UNWIND before the loop
+        is stopped. Stopping first strands its finally clause, which is where
+        the receiver connection is closed: the fake-receiver test caught
+        exactly that, reporting no stream_cancelled and a pending task at
+        interpreter exit.
+        """
+        parked, loop, done = self._parked, self._loop, self._done
+        self._cancel_task()
+        if done is not None and loop is not None and loop.is_running():
+            # Wait on the coroutine's OWN completion event, which its finally
+            # sets. Waiting on the concurrent Future instead does not work:
+            # cancel() marks that Future cancelled immediately and returns
+            # while the coroutine is still unwinding, so the loop got stopped
+            # out from under the close.
+            done.wait(min(timeout, 2.0))
+        self._loop = None
+        if parked and loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)   # cold path ends by itself
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout)
-        self._thread = self._loop = self._task = None
+        self._thread = None
+        self._parked = False
+        self._atv = None
+        self._warm_addr = None
 
 
 def available():
