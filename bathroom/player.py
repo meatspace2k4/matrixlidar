@@ -58,6 +58,10 @@ class PlayError(Exception):
     """The HomePod could not be reached or the track could not be streamed."""
 
 
+class Busy(PlayError):
+    """The receiver is playing something already, so we did not take it."""
+
+
 async def _connect(address, loop, timeout):
     pyatv, Protocol = _pyatv()
     confs = await pyatv.scan(loop, hosts=[address], timeout=timeout)
@@ -67,6 +71,28 @@ async def _connect(address, loop, timeout):
     if not conf.get_service(Protocol.RAOP):
         raise PlayError("%s advertises no RAOP service" % address)
     return await pyatv.connect(conf, loop)
+
+
+async def is_busy(atv):
+    """Is the receiver already playing something of its own?
+
+    Streaming to a HomePod SEIZES it, and what it was playing does not come
+    back when the session closes. Resuming it was tried and abandoned: a
+    stream from an iPhone handles the interruption badly, and a play command
+    afterwards is not the same thing as the stream that was there. So the
+    speaker is left alone instead.
+
+    An unreadable state is NOT busy: the check exists to protect music that
+    is definitely playing, and treating "cannot tell" as busy would silently
+    disable the whole feature the day metadata stops answering.
+    """
+    try:
+        from pyatv.const import DeviceState
+        playing = await atv.metadata.playing()
+        return playing.device_state == DeviceState.Playing
+    except Exception as e:
+        sys.stderr.write("busy check failed (%s); treating as free\n" % e)
+        return False
 
 
 async def ramp_volume(atv, frm, to, seconds, steps=20):
@@ -99,6 +125,8 @@ async def play(path, address, volume=20, timeout=5, on_start=None,
     if on_connect:
         on_connect(atv)
     try:
+        if await is_busy(atv):
+            raise Busy("%s is already playing something" % address)
         # BEFORE stream_file, on this connection. This is the whole point.
         await atv.audio.set_volume(float(volume))
         if on_start:
@@ -191,7 +219,14 @@ class Playback:
         self._thread.start()
         ready.wait(2.0)
 
-    def start(self, path, address, volume=20, on_start=None):
+    def start(self, path, address, volume=20, on_start=None, on_busy=None):
+        """Stream `path`, unless the receiver is already playing something.
+
+        `on_busy()` is called instead of `on_start()` in that case, from the
+        playback thread. It exists because the busy check cannot happen here:
+        this returns immediately (the caller is the frame loop) and the check
+        needs the connection, so the answer arrives after the fact.
+        """
         import threading
 
         # WARM PATH: the session is already open, so this is only the stream.
@@ -202,6 +237,10 @@ class Playback:
 
             async def stream_warm():
                 try:
+                    if await is_busy(atv):
+                        if on_busy:
+                            on_busy()
+                        return
                     await atv.audio.set_volume(float(volume))
                     if on_start:
                         on_start()
@@ -234,6 +273,9 @@ class Playback:
                      on_connect=self._took_connection))
             try:
                 loop.run_until_complete(self._task)
+            except Busy:
+                if on_busy:
+                    on_busy()
             except (asyncio.CancelledError, PlayError, Exception):
                 pass
             finally:

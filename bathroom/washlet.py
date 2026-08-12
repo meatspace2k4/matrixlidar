@@ -18,6 +18,12 @@ Decisions:
   replays on continued sitting, stand-up/sit-down cycles, and the track
   ending; the next entry clears it. There is no dwell and no delay: the
   music starts as the body lands.
+- SKIP: ... UNLESS THE HOMEPOD IS ALREADY PLAYING SOMETHING, in which case
+  nothing is streamed and the speaker is left alone. Streaming seizes it and
+  what it was playing does not come back when the session closes; resuming
+  it afterwards was tried and abandoned, because an iPhone stream handles
+  the interruption badly and a play command is not the stream that was
+  there. Somebody's music beats the jingle.
 - UNQUEUE: occupancy ends with no sit (entry aborted, stream gap, or exit)
   -> stop the entry sound.
 - STOP (vacancy): room EMPTY while posture also reads EMPTY -> stop
@@ -539,8 +545,18 @@ def main():
                     # one pyatv session, volume set before the first sample, and
                     # the same object fades it when the toilet is done with.
                     # "warm" means the entry already paid for scan+connect.
+                    def _busy():
+                        # THE SPEAKER WAS ALREADY PLAYING. Streaming would
+                        # seize it and what it was playing does not come back;
+                        # resuming it was tried and abandoned (an iPhone
+                        # stream handles the interruption badly). So the
+                        # music wins and this visit gets nothing.
+                        _log("SKIP  the HomePod is already playing; "
+                             "leaving it alone")
+                        window.ended()
+
                     how = fader.start(args.media, args.homepod,
-                                      volume=args.volume)
+                                      volume=args.volume, on_busy=_busy)
                     if how == "cold":
                         _log("      (cold session: connecting now, "
                              "the entry warm-up did not land)")
