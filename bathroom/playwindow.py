@@ -26,7 +26,7 @@ fire again inside its refractory window (2s), and this machine additionally
 ignores a wave in the same frame it started playing.
 """
 
-AUTO_FADE_S = 25.0   # unheld playback fades after this much. Measured
+AUTO_FADE_S = 30.0   # unheld playback fades after this much. Measured
                      # against nothing: it is a taste setting, and the one
                      # number here that is meant to be argued with. The
                      # matching CLI flag is --auto-fade.

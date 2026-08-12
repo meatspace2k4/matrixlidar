@@ -30,7 +30,7 @@ Decisions:
 
 HOW LONG THE TRACK PLAYS (bathroom/playwindow.py)
 
-- by default it fades out after --auto-fade seconds (25) of playback: most
+- by default it fades out after --auto-fade seconds (30) of playback: most
   visits want a few seconds of music, not the whole song
 - a hand WAVED NEAR THE SENSOR during playback HOLDS it open: the timer is
   cancelled, the track plays on indefinitely, and the volume RAMPS up to

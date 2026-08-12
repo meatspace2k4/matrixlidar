@@ -113,7 +113,7 @@ def main():
           "the next playback is a fresh window, not still held")
     n += 2
 
-    check(AUTO_FADE_S == 25.0, "the shipped window is 25s")
+    check(AUTO_FADE_S == 30.0, "the shipped window is 30s")
     n += 1
 
     print("\n%d checks, %d failures" % (n, len(FAILS)))
